@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="281 229 462 545" role="img" aria-labelledby="title">
+  <title id="title">Zouch</title>
+  <defs>
+    <linearGradient id="cushion" x1="0" y1="253" x2="0" y2="395" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F54748"/>
+      <stop offset="0.34" stop-color="#F24B4B"/>
+      <stop offset="0.48" stop-color="#EA2128"/>
+      <stop offset="1" stop-color="#EA2128"/>
+    </linearGradient>
+  </defs>
+  <path d="M655 340 L360 638" fill="none" stroke="#EA2128" stroke-width="142" stroke-linecap="round"/>
+  <rect x="301" y="253" width="422" height="142" rx="71" fill="url(#cushion)"/>
+  <rect x="301" y="570" width="422" height="142" rx="71" fill="#EA2128"/>
+  <rect x="323" y="708" width="55" height="46" rx="18" fill="#EA2128"/>
+  <rect x="646" y="708" width="55" height="46" rx="18" fill="#EA2128"/>
+</svg>

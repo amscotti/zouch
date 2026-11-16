@@ -1,0 +1,20 @@
+services:
+  zouch:
+    build: .
+    image: zouch:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5985:5985"
+    environment:
+      ZOUCH_AUTH: "${ZOUCH_AUTH:?set ZOUCH_AUTH to user:password}"
+    volumes:
+      - zouch-data:/var/lib/zouch
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  zouch-data:

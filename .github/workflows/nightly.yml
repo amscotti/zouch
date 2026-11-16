@@ -1,0 +1,54 @@
+name: Nightly integration
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-integration
+  cancel-in-progress: true
+
+jobs:
+  couchdb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      couchdb:
+        image: couchdb:3.5.3
+        env:
+          COUCHDB_USER: admin
+          COUCHDB_PASSWORD: zouchtestpw
+        ports:
+          - 5984:5984
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libicu-dev
+
+      - name: Wait for CouchDB
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS -u admin:zouchtestpw http://127.0.0.1:5984/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CouchDB did not become ready" >&2
+          exit 1
+
+      - name: Local quality gate
+        run: ./scripts/ci.sh
+
+      - name: CouchDB-backed replication
+        run: ./scripts/integration.sh

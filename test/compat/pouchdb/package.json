@@ -1,0 +1,12 @@
+{
+  "name": "zouch-pouchdb-check",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "pouchdb": "^9.0.0",
+    "pouchdb-adapter-memory": "^9.0.0"
+  }
+}

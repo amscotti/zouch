@@ -1,0 +1,282 @@
+{
+  "timestamp": "2026-11-15T22:26:07.201497+00:00",
+  "git_commit": "7068915",
+  "scale": "small",
+  "threads": 8,
+  "system": {
+    "platform": "macOS-26.6-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.6",
+    "cpu_count": 10
+  },
+  "zouch": {
+    "put_seq": {
+      "ops": 200,
+      "total_ms": 87.9,
+      "ops_per_sec": 2275.3,
+      "p50_ms": 0.19,
+      "p95_ms": 0.42,
+      "p99_ms": 12.28,
+      "mean_ms": 0.44,
+      "docs": 200,
+      "docs_per_sec": 2275.3
+    },
+    "put_conc": {
+      "ops": 400,
+      "total_ms": 55.88,
+      "ops_per_sec": 7158.0,
+      "p50_ms": 0.87,
+      "p95_ms": 2.5,
+      "p99_ms": 3.18,
+      "mean_ms": 1.06,
+      "docs": 400,
+      "docs_per_sec": 7158.0
+    },
+    "get_seq": {
+      "ops": 200,
+      "total_ms": 30.92,
+      "ops_per_sec": 6469.3,
+      "p50_ms": 0.06,
+      "p95_ms": 0.58,
+      "p99_ms": 1.33,
+      "mean_ms": 0.15
+    },
+    "get_conc": {
+      "ops": 400,
+      "total_ms": 24.29,
+      "ops_per_sec": 16470.0,
+      "p50_ms": 0.35,
+      "p95_ms": 1.09,
+      "p99_ms": 1.49,
+      "mean_ms": 0.44
+    },
+    "bulk_docs": {
+      "ops": 20,
+      "total_ms": 29.31,
+      "ops_per_sec": 682.3,
+      "p50_ms": 1.08,
+      "p95_ms": 2.92,
+      "p99_ms": 3.2,
+      "mean_ms": 1.4,
+      "docs": 2000,
+      "docs_per_sec": 68225.2
+    },
+    "all_docs": {
+      "ops": 15,
+      "total_ms": 91.87,
+      "ops_per_sec": 163.3,
+      "p50_ms": 5.82,
+      "p95_ms": 8.07,
+      "p99_ms": 8.46,
+      "mean_ms": 6.12,
+      "docs": 30000,
+      "docs_per_sec": 326550.3
+    },
+    "changes": {
+      "ops": 15,
+      "total_ms": 14.25,
+      "ops_per_sec": 1052.9,
+      "p50_ms": 0.93,
+      "p95_ms": 1.25,
+      "p99_ms": 1.46,
+      "mean_ms": 0.95,
+      "docs": 30000,
+      "docs_per_sec": 2105817.2
+    },
+    "mango_scan": {
+      "ops": 15,
+      "total_ms": 47.92,
+      "ops_per_sec": 313.0,
+      "p50_ms": 2.94,
+      "p95_ms": 3.87,
+      "p99_ms": 3.95,
+      "mean_ms": 3.19
+    },
+    "mango_index": {
+      "ops": 21,
+      "total_ms": 70.72,
+      "ops_per_sec": 296.9,
+      "p50_ms": 2.63,
+      "p95_ms": 7.42,
+      "p99_ms": 7.64,
+      "mean_ms": 3.37
+    },
+    "view_cold": {
+      "ops": 1,
+      "total_ms": 47.97,
+      "ops_per_sec": 20.8,
+      "p50_ms": 47.97,
+      "p95_ms": 47.97,
+      "p99_ms": 47.97,
+      "mean_ms": 47.97,
+      "docs": 2000,
+      "docs_per_sec": 41689.4
+    },
+    "view_warm": {
+      "ops": 25,
+      "total_ms": 82.27,
+      "ops_per_sec": 303.9,
+      "p50_ms": 3.08,
+      "p95_ms": 5.06,
+      "p99_ms": 5.79,
+      "mean_ms": 3.29
+    },
+    "replicate_local": {
+      "ops": 1,
+      "total_ms": 3.46,
+      "ops_per_sec": 288.9,
+      "p50_ms": 3.46,
+      "p95_ms": 3.46,
+      "p99_ms": 3.46,
+      "mean_ms": 3.46,
+      "docs": 500,
+      "docs_per_sec": 144437.4
+    },
+    "replicate_from_couch": {
+      "ops": 1,
+      "total_ms": 112.06,
+      "ops_per_sec": 8.9,
+      "p50_ms": 112.06,
+      "p95_ms": 112.06,
+      "p99_ms": 112.06,
+      "mean_ms": 112.06,
+      "docs": 500,
+      "docs_per_sec": 4461.7
+    },
+    "replicate_to_couch": {
+      "ops": 1,
+      "total_ms": 71.22,
+      "ops_per_sec": 14.0,
+      "p50_ms": 71.22,
+      "p95_ms": 71.22,
+      "p99_ms": 71.22,
+      "mean_ms": 71.22,
+      "docs": 500,
+      "docs_per_sec": 7020.2
+    }
+  },
+  "couchdb": {
+    "put_seq": {
+      "ops": 200,
+      "total_ms": 1302.44,
+      "ops_per_sec": 153.6,
+      "p50_ms": 4.89,
+      "p95_ms": 15.26,
+      "p99_ms": 19.99,
+      "mean_ms": 6.51,
+      "docs": 200,
+      "docs_per_sec": 153.6
+    },
+    "put_conc": {
+      "ops": 400,
+      "total_ms": 747.25,
+      "ops_per_sec": 535.3,
+      "p50_ms": 12.17,
+      "p95_ms": 29.26,
+      "p99_ms": 35.83,
+      "mean_ms": 14.79,
+      "docs": 400,
+      "docs_per_sec": 535.3
+    },
+    "get_seq": {
+      "ops": 200,
+      "total_ms": 522.4,
+      "ops_per_sec": 382.8,
+      "p50_ms": 1.77,
+      "p95_ms": 5.75,
+      "p99_ms": 9.09,
+      "mean_ms": 2.61
+    },
+    "get_conc": {
+      "ops": 400,
+      "total_ms": 282.14,
+      "ops_per_sec": 1417.7,
+      "p50_ms": 4.29,
+      "p95_ms": 12.15,
+      "p99_ms": 16.62,
+      "mean_ms": 5.61
+    },
+    "bulk_docs": {
+      "ops": 20,
+      "total_ms": 421.92,
+      "ops_per_sec": 47.4,
+      "p50_ms": 14.4,
+      "p95_ms": 43.04,
+      "p99_ms": 56.48,
+      "mean_ms": 21.02,
+      "docs": 2000,
+      "docs_per_sec": 4740.3
+    },
+    "all_docs": {
+      "ops": 15,
+      "total_ms": 4279.83,
+      "ops_per_sec": 3.5,
+      "p50_ms": 275.76,
+      "p95_ms": 372.34,
+      "p99_ms": 423.43,
+      "mean_ms": 285.32,
+      "docs": 30000,
+      "docs_per_sec": 7009.6
+    },
+    "changes": {
+      "ops": 15,
+      "total_ms": 1122.93,
+      "ops_per_sec": 13.4,
+      "p50_ms": 75.49,
+      "p95_ms": 85.85,
+      "p99_ms": 89.25,
+      "mean_ms": 74.86,
+      "docs": 30000,
+      "docs_per_sec": 26715.8
+    },
+    "mango_scan": {
+      "ops": 15,
+      "total_ms": 981.75,
+      "ops_per_sec": 15.3,
+      "p50_ms": 72.71,
+      "p95_ms": 92.26,
+      "p99_ms": 93.71,
+      "mean_ms": 65.45
+    },
+    "mango_index": {
+      "ops": 21,
+      "total_ms": 490.65,
+      "ops_per_sec": 42.8,
+      "p50_ms": 12.79,
+      "p95_ms": 37.32,
+      "p99_ms": 153.57,
+      "mean_ms": 23.36
+    },
+    "view_cold": {
+      "ops": 1,
+      "total_ms": 287.74,
+      "ops_per_sec": 3.5,
+      "p50_ms": 287.74,
+      "p95_ms": 287.74,
+      "p99_ms": 287.74,
+      "mean_ms": 287.74,
+      "docs": 2000,
+      "docs_per_sec": 6950.8
+    },
+    "view_warm": {
+      "ops": 25,
+      "total_ms": 99.44,
+      "ops_per_sec": 251.4,
+      "p50_ms": 3.06,
+      "p95_ms": 7.77,
+      "p99_ms": 8.96,
+      "mean_ms": 3.98
+    },
+    "replicate_local": {
+      "ops": 1,
+      "total_ms": 2054.81,
+      "ops_per_sec": 0.5,
+      "p50_ms": 2054.81,
+      "p95_ms": 2054.81,
+      "p99_ms": 2054.81,
+      "mean_ms": 2054.81,
+      "docs": 500,
+      "docs_per_sec": 243.3
+    }
+  }
+}
