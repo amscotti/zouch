@@ -5706,7 +5706,12 @@ fn runReplicationJob(
                 .source = source_ep.clean_url,
                 .since = since_seq orelse if (remote_cp) |c| c.since else null,
                 .page_size = page_size,
-                .use_checkpoints = use_checkpoints,
+                // The staging DB is dropped with the job, and its seq numbers
+                // restart each run. A checkpoint taken in that domain would
+                // skip later documents on resume, so the inner stages run
+                // without checkpoints and the target checkpoint above owns
+                // resume (in source-seq terms) for the whole job.
+                .use_checkpoints = false,
                 .target_path = "",
                 .username = source_ep.user,
                 .password = source_ep.password,
@@ -5727,9 +5732,11 @@ fn runReplicationJob(
                 .diag = diag,
                 .guard = replGuard(app),
                 .doc_ids = if (has_selection) &remote_selection else null,
-                .use_checkpoints = use_checkpoints,
+                .use_checkpoints = false,
                 .worker_batch_size = page_size,
-                .since = since_seq,
+                // Stage seqs restart each run, so the source since_seq (in
+                // source-seq terms) cannot gate the push. Push the whole stage.
+                .since = null,
                 .source_name = source_ep.raw_url,
             });
             defer if (pushed.end_seq) |e| app.alloc.free(e);

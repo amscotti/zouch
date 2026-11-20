@@ -61,7 +61,7 @@ docs=$(curl -sS -u "$AUTH" "$COUCH/$TGT/_all_docs" | jq -r .total_rows)
 
 cp=$(checkpoints)
 case "$cp" in
-  *_local/zouch-pull-*) ;;
+  _local/*) ;;
   *) echo "FAIL: no checkpoint on the target, saw '$cp'"; exit 1 ;;
 esac
 rev1=$(echo "$cp" | awk '{print $NF}')
