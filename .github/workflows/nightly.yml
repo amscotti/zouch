@@ -16,14 +16,6 @@ jobs:
   couchdb:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    services:
-      couchdb:
-        image: couchdb:3.5.3
-        env:
-          COUCHDB_USER: admin
-          COUCHDB_PASSWORD: zouchtestpw
-        ports:
-          - 5984:5984
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -35,6 +27,17 @@ jobs:
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libicu-dev
+
+      # CouchDB must share the runner's network namespace: the replication
+      # suites make CouchDB replicate to the Zouch process running on the
+      # runner at 127.0.0.1:6050/7090. A bridged service container has its own
+      # loopback, so those targets get econnrefused (Linux has no Docker
+      # Desktop host.docker.internal fallback).
+      - name: Start CouchDB
+        run: |
+          docker run -d --name couchdb --network host \
+            -e COUCHDB_USER=admin -e COUCHDB_PASSWORD=zouchtestpw \
+            couchdb:3.5.3
 
       - name: Wait for CouchDB
         run: |
