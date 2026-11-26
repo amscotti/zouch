@@ -26,6 +26,7 @@ Each starts its own server on a private port and needs nothing running.
 | `test/compat/combined_soak.sh` | Combined power-cut + soak campaign.  Writes a stream of documents through Zouch on a FUSE disk that commits only on fsync, cuts power at a fixed interval, restarts against the backing directory, and verifies every acknowledged document after each cut. Defaults to 24 hours; set COMBINED_SECONDS and CUT_EVERY for a shorter campaign. |
 | `test/compat/conflict_app.sh` | Conflicts are application-level: a losing leaf stays visible until the application explicitly deletes it. |
 | `test/compat/crash.sh` | Kill -9 recovery and torn-WAL-tail check. |
+| `test/compat/crash_requests.sh` | Requests that used to abort the whole process (float formatting, throwing map functions, big integers in _find, limit/skip overflow, _local rev overflow, _scheduler/jobs) must answer and leave the server alive. |
 | `test/compat/dirsync.sh` | Verify that atomic storage writes fsync the containing directory after rename. |
 | `test/compat/diskfull.sh` | Disk-full and read-only data directories must fail requests cleanly and leave the database recoverable, rather than panicking or silently acking the write. |
 | `test/compat/fauxton_support.sh` | What Fauxton needs beyond the document API: the build itself at /_utils, the setup probe it calls on load, the config page, and a session that works when no credential is configured - CouchDB's admin party. |

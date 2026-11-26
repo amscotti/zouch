@@ -74,4 +74,5 @@ fi
 ./test/compat/feeds_continuous.sh
 ./test/compat/auto_compact.sh
 ./test/compat/crash.sh
+./test/compat/crash_requests.sh
 echo "CI checks passed"

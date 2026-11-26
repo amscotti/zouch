@@ -1413,7 +1413,7 @@ pub const Db = struct {
         if (self.max_memory_bytes > 0 and projected > self.max_memory_bytes) {
             return error.MemoryLimitExceeded;
         }
-        const rev: u32 = if (parent) |p| p + 1 else 1;
+        const rev: u32 = if (parent) |p| (std.math.add(u32, p, 1) catch return error.InvalidRev) else 1;
         const l = try createLocal(self.alloc, id, rev, body);
         errdefer {
             self.alloc.free(l.id);

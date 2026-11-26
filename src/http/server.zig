@@ -2333,6 +2333,7 @@ fn hLocalPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     const rev = db.putLocalDoc(id, body, parent) catch |e| switch (e) {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
+        error.InvalidRev => return err(res, 400, "bad_request", "Invalid rev format"),
         else => return e,
     };
     var l: std.ArrayListUnmanaged(u8) = .empty;
@@ -2866,7 +2867,9 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // concurrent reads/writes on this DB are not blocked.
         var mutex_held = false;
         db.mutex.unlock(app.io);
-        errdefer if (!mutex_held) db.mutex.lockUncancelable(app.io);
+        // `defer`, not `errdefer`: a failed map is reported with a normal
+        // `return err(...)`, and the caller's `defer releaseDb` unlocks again.
+        defer if (!mutex_held) db.mutex.lockUncancelable(app.io);
 
         const task_pid = if (need_build) app.beginTask("indexer", name, id, null, null, null, snap_docs.items.len) else 0;
         defer app.endTask(task_pid);
@@ -3106,7 +3109,7 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         const r_total = reduced.items.len;
         const r_start = @min(skip, r_total);
         var r_end = r_total;
-        if (limit > 0 and r_start + limit < r_end) r_end = r_start + limit;
+        if (limit > 0 and r_end - r_start > limit) r_end = r_start + limit;
 
         try l.appendSlice(res.arena, "{\"rows\":[");
         var ri = r_start;
@@ -3122,7 +3125,7 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         const total = view_rows.len;
         const start = @min(skip, total);
         var end = total;
-        if (limit > 0 and start + limit < end) end = start + limit;
+        if (limit > 0 and end - start > limit) end = start + limit;
 
         try l.appendSlice(res.arena, "{\"total_rows\":");
         try appendInt(&l, res.arena, total);
@@ -6569,7 +6572,7 @@ fn hAllDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const total = arr.items.len;
     const start = @min(skip, filtered.items.len);
     var end = filtered.items.len;
-    if (limit > 0 and start + limit < end) end = start + limit;
+    if (limit > 0 and end - start > limit) end = start + limit;
 
     var l: std.ArrayListUnmanaged(u8) = .empty;
     try l.appendSlice(res.arena, "{\"total_rows\":");
@@ -6970,7 +6973,7 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
     // are not blocked. db remains pinned by acquireDb.
     var mutex_held = false;
     db.mutex.unlock(app.io);
-    errdefer if (!mutex_held) db.mutex.lockUncancelable(app.io);
+    defer if (!mutex_held) db.mutex.lockUncancelable(app.io);
 
     const task_pid = app.beginTask("indexer", name, "_design/vector", null, null, null, snap_vecs.items.len);
     defer app.endTask(task_pid);
@@ -7196,6 +7199,8 @@ fn jsonNumber(v: std.json.Value) ?f64 {
     return switch (v) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
+        // Integers outside i64 and literals such as 1e999 arrive as text.
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
         else => null,
     };
 }
@@ -7214,6 +7219,33 @@ fn typeRank(v: std.json.Value) u8 {
     };
 }
 
+/// Order two integer literals of any size by sign, digit count, then digits.
+/// Null when either is not a plain integer (fraction or exponent), so the
+/// caller falls back to `f64`.
+fn bigIntCmp(a: []const u8, b: []const u8) ?i32 {
+    const na = a.len > 0 and a[0] == '-';
+    const nb = b.len > 0 and b[0] == '-';
+    const da = std.mem.trimStart(u8, if (na) a[1..] else a, "0");
+    const db_ = std.mem.trimStart(u8, if (nb) b[1..] else b, "0");
+    for (da) |c| if (c < '0' or c > '9') return null;
+    for (db_) |c| if (c < '0' or c > '9') return null;
+    const zero_a = da.len == 0;
+    const zero_b = db_.len == 0;
+    if (zero_a and zero_b) return 0;
+    const sa: i32 = if (zero_a) 0 else if (na) -1 else 1;
+    const sb: i32 = if (zero_b) 0 else if (nb) -1 else 1;
+    if (sa != sb) return if (sa < sb) -1 else 1;
+    var mag: i32 = if (da.len != db_.len)
+        (if (da.len < db_.len) -1 else 1)
+    else switch (std.mem.order(u8, da, db_)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+    if (sa < 0) mag = -mag;
+    return mag;
+}
+
 fn valueCmp(a: std.json.Value, b: std.json.Value) ?i32 {
     const ra = typeRank(a);
     const rb = typeRank(b);
@@ -7222,8 +7254,11 @@ fn valueCmp(a: std.json.Value, b: std.json.Value) ?i32 {
         0 => return 0,
         1 => return if (a.bool == b.bool) 0 else if (!a.bool) -1 else 1,
         2 => {
-            const na = jsonNumber(a).?;
-            const nb = jsonNumber(b).?;
+            if (a == .number_string and b == .number_string) {
+                if (bigIntCmp(a.number_string, b.number_string)) |c| return c;
+            }
+            const na = jsonNumber(a) orelse 0;
+            const nb = jsonNumber(b) orelse 0;
             if (na < nb) return -1;
             if (na > nb) return 1;
             return 0;
@@ -7678,7 +7713,7 @@ fn buildMangoIndexFieldsOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: st
         mutex_held = false;
         db.mutex.unlock(a.io);
     }
-    errdefer if (!mutex_held) {
+    defer if (!mutex_held) {
         if (app) |a| db.mutex.lockUncancelable(a.io);
     };
     const task_pid = if (app) |a| a.beginTask("indexer", db_name orelse "", "_design/zouch", null, null, null, snap_docs.items.len) else 0;
@@ -7808,7 +7843,7 @@ fn buildMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.
         mutex_held = false;
         db.mutex.unlock(a.io);
     }
-    errdefer if (!mutex_held) {
+    defer if (!mutex_held) {
         if (app) |a| db.mutex.lockUncancelable(a.io);
     };
     const task_pid = if (app) |a| a.beginTask("indexer", db_name orelse "", "_design/zouch", null, null, null, snap_docs.items.len) else 0;
@@ -8582,9 +8617,9 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             }
         }
     }
-    const start = @min(bookmarked + skip, matches.items.len);
+    const start = @min(bookmarked +| skip, matches.items.len);
     var end = matches.items.len;
-    if (start + limit < end) end = start + limit;
+    if (end - start > limit) end = start + limit;
 
     var l: std.ArrayListUnmanaged(u8) = .empty;
     try l.appendSlice(res.arena, "{\"docs\":[");
@@ -9285,7 +9320,7 @@ fn hSchedulerJobs(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
         try l.appendSlice(res.arena, "{\"database\":\"_replicator\",\"id\":");
         if (r.repl_id) |id| try jsonw.writeString(&l, res.arena, id) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"pid\":\"<0.");
-        try appendInt(&l, res.arena, @as(u64, @intCast(std.os.linux.getpid())));
+        try appendInt(&l, res.arena, @as(u64, @intCast(std.c.getpid())));
         try l.appendSlice(res.arena, ".0>\",\"source\":");
         if (r.source) |s| try jsonw.writeString(&l, res.arena, s) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"target\":");

@@ -13,9 +13,7 @@ pub fn writeString(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, 
             0x0c => try list.appendSlice(alloc, "\\f"),
             else => {
                 if (c < 0x20) {
-                    var buf: [6]u8 = undefined;
-                    _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try list.appendSlice(alloc, &buf);
+                    try list.print(alloc, "\\u{x:0>4}", .{c});
                 } else {
                     try list.append(alloc, c);
                 }
@@ -25,20 +23,26 @@ pub fn writeString(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, 
     try list.append(alloc, '"');
 }
 
+/// Format a float without a fixed-size buffer: `{d}` prints every digit of
+/// 1e100, so the output has to grow with the value. Magnitudes that plain
+/// decimal notation would stretch over many digits use exponent form, like
+/// JavaScript's `Number.prototype.toString`. JSON has no NaN or infinity.
+pub fn writeFloat(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, f: f64) !void {
+    if (!std.math.isFinite(f)) return list.appendSlice(alloc, "null");
+    const mag = @abs(f);
+    if (mag >= 1e21 or (mag != 0 and mag < 1e-6)) {
+        try list.print(alloc, "{e}", .{f});
+    } else {
+        try list.print(alloc, "{d}", .{f});
+    }
+}
+
 pub fn writeValue(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: std.json.Value) !void {
     switch (v) {
         .null => try list.appendSlice(alloc, "null"),
         .bool => |b| try list.appendSlice(alloc, if (b) "true" else "false"),
-        .integer => |i| {
-            var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
-            try list.appendSlice(alloc, s);
-        },
-        .float => |f| {
-            var buf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
-            try list.appendSlice(alloc, s);
-        },
+        .integer => |i| try list.print(alloc, "{d}", .{i}),
+        .float => |f| try writeFloat(list, alloc, f),
         .number_string => |s| try list.appendSlice(alloc, s),
         .string => |s| try writeString(list, alloc, s),
         .array => |arr| {
@@ -100,4 +104,20 @@ fn oomWorkload(alloc: std.mem.Allocator) !void {
 
 test "json writer survives allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, oomWorkload, .{});
+}
+
+test "floats of any magnitude format without overflow and round-trip" {
+    const alloc = std.testing.allocator;
+    const cases = [_]f64{ 1e100, 1.7976931348623157e308, 5e-324, 1e-63, 1.5, -2.5e-30, 0, 123456789.125, 1e21, 1e-7 };
+    for (cases) |f| {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(alloc);
+        try writeValue(&buf, alloc, .{ .float = f });
+        const back = try std.fmt.parseFloat(f64, buf.items);
+        try std.testing.expectEqual(f, back);
+    }
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try writeValue(&buf, alloc, .{ .float = std.math.inf(f64) });
+    try std.testing.expectEqualStrings("null", buf.items);
 }
