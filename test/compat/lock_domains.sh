@@ -131,7 +131,8 @@ EOF
 # --- 2. feeds and attachment downloads racing rewrites of one document ------
 curl -fsS -m 10 -X PUT "$Z/hot" >/dev/null
 REV=$(curl -fsS -m 10 -X PUT "$Z/hot/doc" -H "$J" -d '{"v":0}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["rev"])')
-REV=$(curl -fsS -m 10 -X PUT "$Z/hot/doc/att?rev=$REV" -H 'content-type: text/plain' --data-binary "$(head -c 400000 /dev/zero | tr '\0' 'a')" | python3 -c 'import sys,json;print(json.load(sys.stdin)["rev"])')
+head -c 400000 /dev/zero | tr '\0' 'a' > "$TMP/att.bin"
+REV=$(curl -fsS -m 10 -X PUT "$Z/hot/doc/att?rev=$REV" -H 'content-type: text/plain' --data-binary "@$TMP/att.bin" | python3 -c 'import sys,json;print(json.load(sys.stdin)["rev"])')
 
 STOP="$TMP/stop"
 rewriter() {
