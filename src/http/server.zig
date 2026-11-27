@@ -3548,18 +3548,14 @@ fn gzipDecodedReaderLen(reader: *std.Io.Reader, max_bytes: usize) !usize {
 
 fn gzipDecompress(alloc: std.mem.Allocator, data: []const u8, max_bytes: usize) ![]u8 {
     var in: std.Io.Reader = .fixed(data);
-    var decompress: flate.Decompress = .init(&in, .gzip, &.{});
+    var win_buf: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&in, .gzip, &win_buf);
     var aw: std.Io.Writer.Allocating = .init(alloc);
     errdefer aw.deinit();
     var l_buf: [4096]u8 = undefined;
-    var limited = decompress.reader.limited(.limited(max_bytes), &l_buf);
-    _ = try limited.interface.streamRemaining(&aw.writer);
-    if (aw.writer.end == max_bytes) {
-        if (decompress.reader.peekByte()) |_| return error.TooLarge else |e| switch (e) {
-            error.EndOfStream => {},
-            error.ReadFailed => return error.BadGzip,
-        }
-    }
+    var limited = decompress.reader.limited(.limited(max_bytes +| 1), &l_buf);
+    const written = try limited.interface.streamRemaining(&aw.writer);
+    if (written > max_bytes) return error.TooLarge;
     return aw.toOwnedSlice();
 }
 

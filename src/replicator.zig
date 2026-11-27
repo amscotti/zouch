@@ -1661,18 +1661,11 @@ fn gzipDecode(alloc: std.mem.Allocator, data: []const u8, max_bytes: usize) ![]u
     var win_buf: [flate.max_window_len]u8 = undefined;
     var decompress: flate.Decompress = .init(&in, .gzip, &win_buf);
     var l_buf: [4096]u8 = undefined;
-    var limited = decompress.reader.limited(.limited(max_bytes), &l_buf);
+    var limited = decompress.reader.limited(.limited(max_bytes +| 1), &l_buf);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const written = limited.interface.streamRemaining(&out.writer) catch return error.InvalidGzip;
-    if (written == max_bytes) {
-        if (decompress.reader.peekByte()) |_| {
-            return error.TooLarge;
-        } else |e| switch (e) {
-            error.EndOfStream => {},
-            error.ReadFailed => return error.InvalidGzip,
-        }
-    }
+    if (written > max_bytes) return error.TooLarge;
     return out.toOwnedSlice();
 }
 
