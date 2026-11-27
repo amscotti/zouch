@@ -30,8 +30,9 @@ current code implements a smaller subset; the rules below that are still aspirat
   (ADR 0008), not borrowed slices.
 - **Storage is WAL + segments + snapshot + A/B manifest** with a single writer, one `.zouch.lock`
   per database. Recovery fails closed on a read error; only `FileNotFound` means "absent".
-- **Views run one QuickJS runtime per query call**, with a 64 MiB memory limit and no interrupt
-  handler. A per-database runtime and time budget are **planned** (Law 3/§5 "QuickJS views").
+- **Views run one QuickJS runtime per query call**, with a 64 MiB memory limit and a 5 s interrupt
+  handler (`JS_SetInterruptHandler`) that aborts runaway map/reduce/filter scripts. Sharing a
+  single runtime per database remains **planned** (Law 3/§5 "QuickJS views").
 - **Feeds are one scheduler thread** that sweeps every registered feed every 50 ms, not a thread
   and ring buffer per feed. Contexts carry their allocator, and deletion is serialized against
   registration (§5 "Feeds" is the target; admission control via `ZOUCH_MAX_FEEDS` is implemented,

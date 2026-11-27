@@ -69,10 +69,7 @@ const TextCache = struct {
 
 const HNSW_FILE_MAGIC = "ZHNSWF01";
 
-fn loadHnswFile(alloc: std.mem.Allocator, bytes: []u8, dim: usize) !*VectorCache {
-    // Ownership of the file buffer transfers here: the decoded cache keeps
-    // owned id copies, so the buffer can be released on every path.
-    defer alloc.free(bytes);
+fn loadHnswFile(alloc: std.mem.Allocator, bytes: []const u8, dim: usize) !*VectorCache {
     if (bytes.len < HNSW_FILE_MAGIC.len + 12 or !std.mem.eql(u8, bytes[0..HNSW_FILE_MAGIC.len], HNSW_FILE_MAGIC)) return error.CorruptIndex;
     var pos: usize = HNSW_FILE_MAGIC.len;
     const seq = std.mem.readInt(u64, bytes[pos..][0..8], .little);
@@ -151,15 +148,17 @@ pub const App = struct {
     text_cache: std.StringHashMapUnmanaged(*TextCache) = .empty,
     view_cache: std.StringHashMapUnmanaged(*ViewCache) = .empty,
     view_cache_mutex: Io.Mutex = .init,
-    repl_done: std.StringHashMapUnmanaged(void) = .empty,
-    /// The job the scheduler thread is running right now, if any: `_scheduler/jobs`
-    /// reports running work, and the scheduler runs a job inline.
-    repl_running: ?RunningJob = null,
+    repl_done: std.StringHashMapUnmanaged(Rev) = .empty,
+    /// Jobs running right now on the bounded replicator worker pool (up to 4).
+    repl_running: std.ArrayListUnmanaged(RunningJob) = .empty,
     repl_retry: std.StringHashMapUnmanaged(ReplicationRetry) = .empty,
     auto_compact_secs: u64 = 3600,
     auto_compact_seq: std.StringHashMapUnmanaged(u64) = .empty,
     auto_compact_tick: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Lock order: feed_mutex -> db.mutex; feed_mutex -> app.mutex; db.mutex -> app.mutex.
+    /// Never hold app.mutex while taking db.mutex, and never hold two db.mutexes at once.
     mutex: Io.Mutex = .init,
+    users_present_cached: std.atomic.Value(i8) = .init(-1),
     feed_threads: std.atomic.Value(u32) = .init(0),
     max_feeds: u32 = 256,
     longpolls: std.ArrayListUnmanaged(*LongpollCtx) = .empty,
@@ -206,6 +205,14 @@ pub const App = struct {
 
     pub fn setMaxBodyMb(self: *App, mb: usize) void {
         self.max_body_bytes = if (mb == 0) 64 * 1024 * 1024 else std.math.mul(usize, mb, 1024 * 1024) catch std.math.maxInt(usize);
+        if (@hasDecl(Db, "setMaxBlobBytes")) {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var it = self.dbs.valueIterator();
+            while (it.next()) |dbp| {
+                dbp.*.setMaxBlobBytes(self.max_body_bytes);
+            }
+        }
     }
 
     pub fn setMaxDbMb(self: *App, mb: usize) void {
@@ -227,6 +234,9 @@ pub const App = struct {
     fn applyDbMemoryCap(self: *App, db: *Db) void {
         if (@hasDecl(Db, "setMaxMemoryBytes") and self.max_db_bytes > 0) {
             db.setMaxMemoryBytes(self.max_db_bytes);
+        }
+        if (@hasDecl(Db, "setMaxBlobBytes")) {
+            db.setMaxBlobBytes(self.max_body_bytes);
         }
     }
 
@@ -370,6 +380,14 @@ pub const App = struct {
             err(res, 413, "too_large", "Request body exceeds ZOUCH_MAX_BODY_MB") catch {};
             return;
         }
+        if (e == error.FileTooLarge) {
+            err(res, 507, "insufficient_storage", "Database file exceeds maximum supported size (2 GiB)") catch {};
+            return;
+        }
+        if (e == error.BadGzip) {
+            err(res, 400, "bad_request", "invalid gzip attachment") catch {};
+            return;
+        }
         if (e == error.MemoryLimitExceeded or e == error.VectorIndexLimitExceeded or e == error.NoSpaceLeft) {
             const msg = if (e == error.VectorIndexLimitExceeded)
                 "Vector index memory budget (ZOUCH_VECTOR_INDEX_MB) exceeded"
@@ -414,8 +432,7 @@ pub const App = struct {
             std.log.warn("corrupt database '{s}' while serving {s}: {}", .{ db_name, req.url.raw, e });
             return;
         }
-        if (e == error.NoSpaceLeft or
-            e == error.ReadOnlyFileSystem or
+        if (e == error.ReadOnlyFileSystem or
             e == error.FileTooBig or
             e == error.Io)
         {
@@ -705,6 +722,7 @@ pub const App = struct {
         }
         if (std.mem.eql(u8, req.url.path, "/_session")) return action(self, req, res);
         if (std.mem.eql(u8, req.url.path, "/_up")) return action(self, req, res);
+        if (std.mem.eql(u8, req.url.path, "/_utils") or std.mem.startsWith(u8, req.url.path, "/_utils/")) return action(self, req, res);
         const db_name = req.params.get("db");
         var has_auth_db = false;
         const expected_auth: ?[]const u8 = blk: {
@@ -734,8 +752,9 @@ pub const App = struct {
             std.mem.eql(u8, req.url.path, "/_cluster_setup") or
             std.mem.startsWith(u8, req.url.path, "/_scheduler/") or
             std.mem.startsWith(u8, req.url.path, "/_node/"));
+        const is_replicator_db = db_name != null and std.mem.eql(u8, db_name.?, "_replicator");
 
-        var auth_required = expected_auth != null or (has_auth_db and is_protected_global);
+        var auth_required = expected_auth != null or (has_auth_db and (is_protected_global or is_replicator_db));
         var auth_ok = false;
         var auth_user: []const u8 = "";
         var auth_roles: []const u8 = "";
@@ -743,16 +762,12 @@ pub const App = struct {
         var pass_buf: [512]u8 = undefined;
         var users_auth = false;
         if (expected_auth == null) {
-            const users_db = self.acquireDb("_users") catch {
+            users_auth = self.hasUsersPresent() catch {
                 res.status = 503;
                 res.content_type = .JSON;
                 res.body = "{\"error\":\"service_unavailable\",\"reason\":\"Authentication database unavailable\"}";
                 return;
             };
-            if (users_db) |udb| {
-                defer self.releaseDb(udb);
-                users_auth = udb.docs.count() > 0;
-            }
             if (users_auth) auth_required = true;
         }
 
@@ -782,7 +797,7 @@ pub const App = struct {
                 if (auth_value) |av| auth_user = basicUser(av, &user_buf) orelse "";
                 auth_roles = self.rolesFor(auth_user);
             }
-        } else if (has_auth_db and is_protected_global) {
+        } else if (has_auth_db and (is_protected_global or is_replicator_db)) {
             if (cookie_user) |cu| {
                 if (cookie_scope.len == 0) {
                     auth_ok = true;
@@ -872,6 +887,12 @@ pub const App = struct {
                     res.body = "{\"error\":\"forbidden\",\"reason\":\"Only _admin users may access _users\"}";
                     return;
                 }
+                if (std.mem.eql(u8, n, "_replicator") and expected_auth == null and !hasCsvRole(auth_roles, "_admin")) {
+                    res.status = 403;
+                    res.content_type = .JSON;
+                    res.body = "{\"error\":\"forbidden\",\"reason\":\"Only _admin users may access _replicator\"}";
+                    return;
+                }
                 if (self.acquireDb(n) catch null) |db| {
                     defer self.releaseDb(db);
                     if (db.securityRestricted()) {
@@ -946,6 +967,8 @@ pub const App = struct {
         var rdit = self.repl_done.keyIterator();
         while (rdit.next()) |key| self.alloc.free(key.*);
         self.repl_done.deinit(self.alloc);
+        for (self.repl_running.items) |r| freeRunningJob(self.alloc, r);
+        self.repl_running.deinit(self.alloc);
         var rrit = self.repl_retry.keyIterator();
         while (rrit.next()) |key| self.alloc.free(key.*);
         self.repl_retry.deinit(self.alloc);
@@ -997,6 +1020,7 @@ pub const App = struct {
         d.close(self.io);
         const db = try Db.open(self.alloc, self.io, p);
         errdefer db.close();
+        db.lock_checks = true;
         self.applyDbMemoryCap(db);
         const key = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(key);
@@ -1006,11 +1030,15 @@ pub const App = struct {
 
     fn createDb(self: *App, name: []const u8) !*Db {
         if (!validName(name)) return error.InvalidName;
-        if (self.dbs.get(name)) |db| return db;
+        if (self.dbs.get(name)) |db| {
+            if (db.closing) return error.DatabaseInUse;
+            return db;
+        }
         const p = try self.path(name);
         defer self.alloc.free(p);
         const db = try Db.open(self.alloc, self.io, p);
         errdefer db.close();
+        db.lock_checks = true;
         self.applyDbMemoryCap(db);
         const key = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(key);
@@ -1018,21 +1046,38 @@ pub const App = struct {
         return db;
     }
 
+    fn dbExists(self: *App, name: []const u8) bool {
+        if (self.dbs.get(name) != null) return true;
+        const p = self.path(name) catch return false;
+        defer self.alloc.free(p);
+        var d = Io.Dir.cwd().openDir(self.io, p, .{}) catch return false;
+        d.close(self.io);
+        return true;
+    }
+
     /// Resolve and pin a database for a replication that runs with the mutex
-    /// released. `deleteDb` refuses while `pins` is non-zero, so the handle
-    /// cannot be freed between pages; the pin is taken under the same lock the
-    /// delete path holds when it checks it.
+    /// released. `deleteDb` refuses while `repl_active` is true, and waits for
+    /// non-replication pins to drain; caller must release with `unpinReplication`.
     fn pinDb(self: *App, name: []const u8) !*Db {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const db = (try self.getDb(name)) orelse return error.DatabaseNotFound;
-        if (db.pins > 0) return error.DatabaseInUse;
+        if (db.closing) return error.DatabaseNotFound;
+        if (db.repl_active) return error.DatabaseInUse;
+        db.repl_active = true;
         db.pins += 1;
         return db;
     }
 
     fn unpinDb(self: *App, db: *Db) void {
         self.mutex.lockUncancelable(self.io);
+        db.pins -= 1;
+        self.mutex.unlock(self.io);
+    }
+
+    fn unpinReplication(self: *App, db: *Db) void {
+        self.mutex.lockUncancelable(self.io);
+        db.repl_active = false;
         db.pins -= 1;
         self.mutex.unlock(self.io);
     }
@@ -1050,14 +1095,18 @@ pub const App = struct {
             self.mutex.unlock(self.io);
             return null;
         };
+        if (db.closing) {
+            self.mutex.unlock(self.io);
+            return null;
+        }
         db.pins += 1;
         self.mutex.unlock(self.io);
-        db.mutex.lockUncancelable(self.io);
+        db.lock();
         return db;
     }
 
     fn releaseDb(self: *App, db: *Db) void {
-        db.mutex.unlock(self.io);
+        db.unlock();
         self.unpinDb(db);
     }
 
@@ -1086,9 +1135,18 @@ pub const App = struct {
                 i += 1;
                 continue;
             }
+            if (ctx.in_flight) {
+                // Scheduler holds this ctx outside feed_mutex; shut down its
+                // socket and let Phase 3 retire and free it.
+                ctx.closing = true;
+                if (@import("builtin").os.tag != .windows) ctx.stream.shutdown(ctx.io, .both) catch {};
+                i += 1;
+                continue;
+            }
             _ = self.longpolls.orderedRemove(i);
             ctx.stream.close(ctx.io);
             if (ctx.filter_spec) |f| ctx.alloc.free(f);
+            if (ctx.filter_query_json) |fq| ctx.alloc.free(fq);
             ctx.alloc.destroy(ctx);
             _ = self.feed_threads.fetchSub(1, .monotonic);
         }
@@ -1099,10 +1157,17 @@ pub const App = struct {
                 ci += 1;
                 continue;
             }
+            if (ctx.in_flight) {
+                ctx.closing = true;
+                if (@import("builtin").os.tag != .windows) ctx.stream.shutdown(ctx.io, .both) catch {};
+                ci += 1;
+                continue;
+            }
             _ = self.continuous.orderedRemove(ci);
-            finishChunks(ctx.stream, ctx.io);
+            if (@import("builtin").os.tag != .windows) ctx.stream.shutdown(ctx.io, .both) catch {};
             ctx.stream.close(ctx.io);
             if (ctx.filter_spec) |f| ctx.alloc.free(f);
+            if (ctx.filter_query_json) |fq| ctx.alloc.free(fq);
             ctx.alloc.destroy(ctx);
             _ = self.feed_threads.fetchSub(1, .monotonic);
         }
@@ -1151,36 +1216,112 @@ pub const App = struct {
         }
     }
 
+    fn invalidateUsersCache(self: *App) void {
+        self.users_present_cached.store(-1, .release);
+    }
+
+    fn hasUsersPresent(self: *App) !bool {
+        const cached = self.users_present_cached.load(.acquire);
+        if (cached >= 0) return cached != 0;
+        const users_db = try self.acquireDb("_users");
+        const present = if (users_db) |udb| blk: {
+            defer self.releaseDb(udb);
+            break :blk udb.docs.count() > 0;
+        } else false;
+        self.users_present_cached.store(if (present) 1 else 0, .release);
+        return present;
+    }
+
+    /// Delete database `name`. Caller must NOT hold `self.mutex` or `self.feed_mutex`.
     fn deleteDb(self: *App, name: []const u8) !bool {
         if (!validName(name)) return false;
         const p = try self.path(name);
         defer self.alloc.free(p);
-        self.dropSearchCaches(name);
-        // Checking the pin and freeing the handle happen in the same critical
-        // section (the caller holds the app mutex), so a replication that is
-        // between pages cannot be freed out from under itself.
-        if (self.dbs.get(name)) |db| {
-            if (db.pins > 0) return error.DatabaseInUse;
+
+        // Phase 1: refuse if replication owns this db; otherwise mark closing
+        // and wait for in-flight HTTP pins to drain without holding `feed_mutex`
+        // (prevents `feed_mutex` <-> `pins` inversion with feed registration).
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var i_set_closing = false;
+            var waited_ms: usize = 0;
+            while (self.dbs.get(name)) |db| {
+                if (db.repl_active) {
+                    if (i_set_closing) db.closing = false;
+                    return error.DatabaseInUse;
+                }
+                if (!db.closing) {
+                    db.closing = true;
+                    i_set_closing = true;
+                }
+                if (db.pins == 0) break;
+                if (waited_ms >= 5000) {
+                    if (i_set_closing) db.closing = false;
+                    return error.DatabaseInUse;
+                }
+                self.mutex.unlock(self.io);
+                sleepMs(self.io, 5);
+                waited_ms += 5;
+                self.mutex.lockUncancelable(self.io);
+            }
         }
-        if (self.dbs.fetchRemove(name)) |kv| {
-            kv.value.close();
-            self.alloc.free(kv.key);
-        } else {
-            var d = Io.Dir.cwd().openDir(self.io, p, .{}) catch return false;
-            d.close(self.io);
+
+        // Phase 2: close remaining feeds, drop caches, closeReadOnly (no snapshot),
+        // and rename directory aside under `feed_mutex` -> `app.mutex`.
+        var trash_path: ?[]u8 = null;
+        defer if (trash_path) |tp| self.alloc.free(tp);
+        var delete_target: []const u8 = p;
+        {
+            self.feed_mutex.lockUncancelable(self.io);
+            defer self.feed_mutex.unlock(self.io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            self.dropSearchCaches(name);
+            if (std.mem.eql(u8, name, "_users")) self.invalidateUsersCache();
+            if (self.dbs.fetchRemove(name)) |kv| {
+                self.closeFeedsForLocked(kv.value);
+                kv.value.closeReadOnly();
+                self.alloc.free(kv.key);
+            } else {
+                var d = Io.Dir.cwd().openDir(self.io, p, .{}) catch return false;
+                d.close(self.io);
+            }
+
+            var rnd: [8]u8 = undefined;
+            self.io.random(&rnd);
+            const hex = std.fmt.bytesToHex(rnd, .lower);
+            const tp = try std.fmt.allocPrint(self.alloc, "{s}.__deleting_{s}", .{ p, &hex });
+            trash_path = tp;
+            if (Io.Dir.rename(Io.Dir.cwd(), p, Io.Dir.cwd(), tp, self.io)) |_| {
+                delete_target = tp;
+            } else |_| {}
         }
-        try Db.deleteDb(self.io, p);
+
+        // Phase 3: delete the directory tree with global mutexes released.
+        try Db.deleteDb(self.io, delete_target);
         return true;
     }
 };
 
 fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > 200) return false;
-    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
     if (std.mem.eql(u8, name, "_users") or std.mem.eql(u8, name, "_replicator")) return true;
-    if (name[0] == '_') return false;
+    if (name[0] < 'a' or name[0] > 'z') return false;
     for (name) |c| {
-        if (c == '/' or c == '\\' or c == 0) return false;
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '$' or c == '(' or c == ')' or c == '+' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn validDocId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (id[0] == '_') {
+        return std.mem.startsWith(u8, id, "_design/") and id.len > "_design/".len;
     }
     return true;
 }
@@ -1245,7 +1386,10 @@ fn validateUserDoc(root: std.json.Value, id: []const u8) !void {
     if (!std.mem.startsWith(u8, id, prefix) or !std.mem.eql(u8, id[prefix.len..], name_v.string)) return error.InvalidUserDoc;
     if (obj.get("roles")) |roles| {
         if (roles != .array) return error.InvalidUserDoc;
-        for (roles.array.items) |role| if (role != .string) return error.InvalidUserDoc;
+        for (roles.array.items) |role| {
+            if (role != .string) return error.InvalidUserDoc;
+            if (std.mem.indexOfScalar(u8, role.string, ',') != null) return error.InvalidUserDoc;
+        }
     }
     if (obj.get("password")) |pw| {
         if (pw != .string or pw.string.len == 0) return error.InvalidUserDoc;
@@ -1283,12 +1427,8 @@ fn verifyUserDoc(
     db: *Db,
     creds: Credentials,
 ) ?UserAuth {
-    var id_buf: [256]u8 = undefined;
-    if (creds.user.len + "org.couchdb.user:".len > id_buf.len) return null;
-    const prefix = "org.couchdb.user:";
-    @memcpy(id_buf[0..prefix.len], prefix);
-    @memcpy(id_buf[prefix.len .. prefix.len + creds.user.len], creds.user);
-    const id = id_buf[0 .. prefix.len + creds.user.len];
+    const id = std.fmt.allocPrint(alloc, "org.couchdb.user:{s}", .{creds.user}) catch return null;
+    defer alloc.free(id);
     const doc = db.get(id) orelse return null;
     const leaf = doc.winnerLeaf();
     if (leaf.deleted) return null;
@@ -1327,6 +1467,7 @@ fn verifyUserDoc(
         if (rv == .array) {
             for (rv.array.items) |item| {
                 if (item != .string) continue;
+                if (std.mem.indexOfScalar(u8, item.string, ',') != null) continue;
                 if (roles.items.len > 0) roles.append(alloc, ',') catch return null;
                 roles.appendSlice(alloc, item.string) catch return null;
             }
@@ -1368,15 +1509,17 @@ fn okIdRev(res: *httpz.Response, id: []const u8, rev: []const u8) !void {
     res.body = l.items;
 }
 
-fn fullBody(req: *httpz.Request, alloc: std.mem.Allocator) ![]const u8 {
+fn fullBody(req: *httpz.Request, alloc: std.mem.Allocator, max_bytes: usize) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
     var r = try req.reader(30_000);
+    // Stack safety note (§5.2 #15): 64 KiB buffer; only called from 16 MiB HTTP
+    // worker threads, never from the 1 MiB feed scheduler thread.
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
         const n = try r.read(&buf);
         if (n == 0) break;
-        if (out.items.len + n > 64 * 1024 * 1024) return error.TooLarge;
+        if (n > max_bytes or out.items.len > max_bytes - n) return error.TooLarge;
         try out.appendSlice(alloc, buf[0..n]);
     }
     return out.toOwnedSlice(alloc);
@@ -1447,7 +1590,10 @@ fn attachmentRaw(db: *Db, alloc: std.mem.Allocator, entry: std.json.Value) !?[]u
         }
     }
     if (entry.object.get("blob")) |blob_v| {
-        if (blob_v == .string) return db.readBlob(alloc, blob_v.string) catch null;
+        if (blob_v == .string) return db.readBlob(alloc, blob_v.string) catch |e| switch (e) {
+            error.FileNotFound, error.InvalidBlob => return null,
+            else => return e,
+        };
     }
     return null;
 }
@@ -1463,14 +1609,22 @@ fn externalizeAttachments(db: *Db, alloc: std.mem.Allocator, atts: *std.json.Val
         const data_v = one.object.get("data") orelse continue;
         if (data_v != .string) continue;
         const raw = (try attachmentRaw(db, alloc, one.*)) orelse continue;
-        var hexbuf: [32]u8 = undefined;
+        var digest_bytes: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(raw, &digest_bytes, .{});
         // The name has to outlive this iteration: the next attachment reuses
         // this stack slot, and every stub would then point at the last blob.
-        const hex = try alloc.dupe(u8, md5Hex(raw, &hexbuf));
+        const hex = try alloc.dupe(u8, &std.fmt.bytesToHex(digest_bytes, .lower));
+        var dbuf: [24]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&dbuf, &digest_bytes);
+        const digest_str = try std.fmt.allocPrint(alloc, "md5-{s}", .{dbuf});
         try db.writeBlob(hex, raw);
         if (one.object.getPtr("data")) |dv| dv.* = .null;
         try one.object.put(alloc, "blob", .{ .string = hex });
+        try one.object.put(alloc, "digest", .{ .string = digest_str });
         try one.object.put(alloc, "stub", .{ .bool = true });
+        if (one.object.get("encoding") != null and one.object.get("encoded_length") == null) {
+            try one.object.put(alloc, "encoded_length", .{ .integer = @intCast(raw.len) });
+        }
         if (one.object.get("length") == null) try one.object.put(alloc, "length", .{ .integer = @intCast(raw.len) });
     }
 }
@@ -1503,14 +1657,6 @@ fn writeAttachments(
     const vals = atts.object.values();
     for (keys, vals) |name, av| {
         if (av != .object) continue;
-        const raw = (try attachmentRaw(db, alloc, av)) orelse continue;
-        const dlen = raw.len;
-
-        var digest: [16]u8 = undefined;
-        std.crypto.hash.Md5.hash(raw, &digest, .{});
-        var dbuf: [24]u8 = undefined;
-        _ = std.base64.standard.Encoder.encode(&dbuf, &digest);
-
         const ct = if (av.object.get("content_type")) |cv|
             (if (cv == .string) cv.string else "application/octet-stream")
         else
@@ -1519,6 +1665,39 @@ fn writeAttachments(
             (if (rv == .integer and rv.integer > 0) (std.math.cast(u32, rv.integer) orelse gen) else gen)
         else
             gen;
+        const enc_v = av.object.get("encoding");
+        const has_enc = enc_v != null and enc_v.? == .string;
+        const stored_digest: ?[]const u8 = if (av.object.get("digest")) |dv| (if (dv == .string) dv.string else null) else null;
+        const stored_len: ?usize = if (av.object.get("length")) |lv| (if (lv == .integer and lv.integer >= 0) @intCast(lv.integer) else null) else null;
+        const stored_enc_len: ?usize = if (av.object.get("encoded_length")) |elv| (if (elv == .integer and elv.integer >= 0) @intCast(elv.integer) else null) else null;
+
+        var raw_opt: ?[]u8 = null;
+        var digest_str: []const u8 = undefined;
+        var digest_buf: [28]u8 = undefined;
+        var orig_len: usize = 0;
+        var enc_len: usize = 0;
+
+        if (mode != .inline_data and stored_digest != null and stored_len != null and (!has_enc or stored_enc_len != null)) {
+            digest_str = stored_digest.?;
+            orig_len = stored_len.?;
+            enc_len = if (has_enc) stored_enc_len.? else orig_len;
+        } else {
+            const raw = (try attachmentRaw(db, alloc, av)) orelse continue;
+            raw_opt = raw;
+            if (stored_digest) |sd| {
+                digest_str = sd;
+            } else {
+                var digest: [16]u8 = undefined;
+                std.crypto.hash.Md5.hash(raw, &digest, .{});
+                var dbuf: [24]u8 = undefined;
+                _ = std.base64.standard.Encoder.encode(&dbuf, &digest);
+                @memcpy(digest_buf[0..4], "md5-");
+                @memcpy(digest_buf[4..28], &dbuf);
+                digest_str = &digest_buf;
+            }
+            orig_len = stored_len orelse raw.len;
+            enc_len = stored_enc_len orelse raw.len;
+        }
 
         if (!first) try tmp.append(alloc, ',');
         first = false;
@@ -1526,32 +1705,28 @@ fn writeAttachments(
         try tmp.appendSlice(alloc, ":{\"content_type\":");
         try jsonw.writeString(&tmp, alloc, ct);
         try tmp.appendSlice(alloc, ",\"revpos\":");
-        var nbuf: [16]u8 = undefined;
+        var nbuf: [24]u8 = undefined;
         try tmp.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d}", .{revpos}) catch "0");
-        try tmp.appendSlice(alloc, ",\"digest\":\"md5-");
-        try tmp.appendSlice(alloc, &dbuf);
-        try tmp.appendSlice(alloc, "\"");
-        const enc_v = av.object.get("encoding");
-        if (enc_v != null and enc_v.? == .string) {
+        try tmp.appendSlice(alloc, ",\"digest\":");
+        try jsonw.writeString(&tmp, alloc, digest_str);
+        if (has_enc) {
             try tmp.appendSlice(alloc, ",\"encoding\":");
             try jsonw.writeString(&tmp, alloc, enc_v.?.string);
         }
         if (mode == .inline_data) {
+            const raw = raw_opt.?;
             const b64len = std.base64.standard.Encoder.calcSize(raw.len);
             const b64 = try alloc.alloc(u8, b64len);
             _ = std.base64.standard.Encoder.encode(b64, raw);
-            try tmp.appendSlice(alloc, ",\"data\":");
-            try jsonw.writeString(&tmp, alloc, b64);
+            try tmp.appendSlice(alloc, ",\"data\":\"");
+            try tmp.appendSlice(alloc, b64);
+            try tmp.append(alloc, '"');
         } else {
-            const orig_len: usize = if (av.object.get("length")) |lv|
-                (if (lv == .integer and lv.integer >= 0) @intCast(lv.integer) else dlen)
-            else
-                dlen;
             try tmp.appendSlice(alloc, ",\"length\":");
             try tmp.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d}", .{orig_len}) catch "0");
-            if (enc_v != null and enc_v.? == .string) {
+            if (has_enc) {
                 try tmp.appendSlice(alloc, ",\"encoded_length\":");
-                try tmp.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d}", .{dlen}) catch "0");
+                try tmp.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d}", .{enc_len}) catch "0");
             }
             try tmp.appendSlice(alloc, if (mode == .follows) ",\"follows\":true" else ",\"stub\":true");
         }
@@ -1655,6 +1830,8 @@ fn writeDoc(
 
 pub fn serve(app: *App, port: u16, bind_all: bool) !void {
     app.ensureSystemDbs();
+    // Feed scheduler runs with a 1 MiB stack and must NOT call large-stack
+    // I/O helpers like `fullBody`, `writeBlobStream`, or `sendBlob`.
     const feed_thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, longpollScheduler, .{app});
     feed_thread.detach();
     const repl_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, replicatorScheduler, .{app});
@@ -1850,7 +2027,7 @@ fn formValue(alloc: std.mem.Allocator, body: []const u8, key: []const u8) !?[]co
 }
 
 fn hSessionPost(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const ctype = req.headers.get("content-type") orelse "";
     var name_s: []const u8 = "";
     var pass_s: []const u8 = "";
@@ -1872,7 +2049,7 @@ fn hSessionPost(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var roles: []const u8 = "_admin";
     const token = (try app.createSession(name_s, pass_s, res.arena, &roles)) orelse
         return err(res, 401, "unauthorized", "Name or password is incorrect.");
-    const cookie = try std.fmt.allocPrint(res.arena, "AuthSession={s}; Version=1; Path=/; HttpOnly", .{token});
+    const cookie = try std.fmt.allocPrint(res.arena, "AuthSession={s}; Version=1; Path=/; HttpOnly; SameSite=Lax", .{token});
     res.headers.add("set-cookie", cookie);
     var l: std.ArrayListUnmanaged(u8) = .empty;
     try l.appendSlice(res.arena, "{\"ok\":true,\"name\":");
@@ -1952,11 +2129,7 @@ fn hSession(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         break :blk app.auth_header != null or app.auth_db.count() > 0;
     };
     if (name == null and !has_configured_auth) {
-        var users_present = false;
-        if (try app.acquireDb("_users")) |udb| {
-            defer app.releaseDb(udb);
-            users_present = udb.docs.count() > 0;
-        }
+        const users_present = try app.hasUsersPresent();
         if (!users_present) roles = "_admin";
     }
 
@@ -1986,7 +2159,7 @@ fn hSession(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// no session to delete on the server: the cookie is the whole session, so
 /// clearing it is what logs the client out.
 fn hSessionDelete(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
-    res.headers.add("set-cookie", "AuthSession=; Version=1; Path=/; HttpOnly; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    res.headers.add("set-cookie", "AuthSession=; Version=1; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
     res.content_type = .JSON;
     res.body = "{\"ok\":true}";
 }
@@ -2092,19 +2265,41 @@ fn hSecurityGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = db.readSecurity(res.arena) catch return err(res, 500, "internal_error", "security read failed");
 }
 
+fn validSecuritySection(val: std.json.Value) bool {
+    if (val != .object) return false;
+    for ([_][]const u8{ "names", "roles" }) |k| {
+        if (val.object.get(k)) |arr| {
+            if (arr != .array) return false;
+            for (arr.array.items) |item| {
+                if (item != .string) return false;
+            }
+        }
+    }
+    return true;
+}
+
 fn hSecurityPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = std.json.parseFromSlice(std.json.Value, res.arena, body, .{}) catch
         return err(res, 400, "bad_request", "invalid JSON");
     if (root.value != .object) return err(res, 400, "bad_request", "security object required");
+    if (root.value.object.get("admins")) |av| {
+        if (!validSecuritySection(av)) return err(res, 400, "bad_request", "invalid admins security object");
+    }
+    if (root.value.object.get("members")) |mv| {
+        if (!validSecuritySection(mv)) return err(res, 400, "bad_request", "invalid members security object");
+    }
     const auth = try requestAuth(app, req, res);
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
     if (!auth.admin and !db.securityAdmin(auth.user, auth.roles)) {
         return err(res, 403, "forbidden", "Only database admins may change security");
     }
-    db.writeSecurity(body) catch |e| return e;
+    db.writeSecurity(body) catch |e| switch (e) {
+        error.Corrupt => return err(res, 400, "bad_request", "invalid security object"),
+        else => return e,
+    };
     res.status = 200;
     res.content_type = .JSON;
     res.body = "{\"ok\":true}";
@@ -2123,10 +2318,19 @@ fn requireReplicatorAdmin(app: *App, req: *httpz.Request, res: *httpz.Response, 
 fn hDbPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     if (!try requireReplicatorAdmin(app, req, res, name)) return;
+    if (!validName(name)) return err(res, 400, "illegal_database_name", "invalid name");
     app.mutex.lockUncancelable(app.io);
     defer app.mutex.unlock(app.io);
+    if (app.dbs.get(name)) |existing| {
+        if (existing.closing) return err(res, 409, "conflict", "database is being deleted; retry");
+        return err(res, 412, "file_exists", "The database could not be created, the file already exists.");
+    }
+    if (app.dbExists(name)) {
+        return err(res, 412, "file_exists", "The database could not be created, the file already exists.");
+    }
     _ = app.createDb(name) catch |e| switch (e) {
         error.InvalidName => return err(res, 400, "illegal_database_name", "invalid name"),
+        error.DatabaseInUse => return err(res, 409, "conflict", "database is being deleted; retry"),
         else => return e,
     };
     res.status = 201;
@@ -2138,12 +2342,8 @@ fn hDbGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
-    var docs_count: usize = 0;
-    var del_count: usize = 0;
-    var it = db.docs.valueIterator();
-    while (it.next()) |d| {
-        if (d.*.winnerLeaf().deleted) del_count += 1 else docs_count += 1;
-    }
+    const docs_count = db.live_doc_count;
+    const del_count = db.deleted_doc_count;
     var l: std.ArrayListUnmanaged(u8) = .empty;
     try l.appendSlice(res.arena, "{\"db_name\":");
     try jsonw.writeString(&l, res.arena, name);
@@ -2167,11 +2367,7 @@ fn hDbGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         const st = db.dir.statFile(app.io, extra, .{}) catch continue;
         file_bytes += st.size;
     }
-    var body_bytes: u64 = 0;
-    var doc_it = db.docs.valueIterator();
-    while (doc_it.next()) |d| {
-        for (d.*.leaves.items) |leaf| body_bytes += leaf.body.len;
-    }
+    const body_bytes = db.live_body_bytes;
     try l.appendSlice(res.arena, ",\"sizes\":{\"file\":");
     try appendInt(&l, res.arena, file_bytes);
     try l.appendSlice(res.arena, ",\"external\":");
@@ -2199,26 +2395,13 @@ fn hDbHead(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn hDbDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const auth = try requestAuth(app, req, res);
-
-    // Lock order matches the feed scheduler (feed_mutex, then app.mutex).
-    // Holding feed_mutex across the teardown means a feed request that is
-    // still preparing its context cannot append one against the handle that is
-    // about to be freed; it re-checks liveness once it gets the lock.
-    app.feed_mutex.lockUncancelable(app.io);
-    defer app.feed_mutex.unlock(app.io);
-    app.mutex.lockUncancelable(app.io);
-    const closing_db = app.getDb(name) catch null;
-    // A null handle means the database does not exist; it must not be read as
-    // "every database" here or a 404 would tear down unrelated feeds.
-    if (closing_db) |db| app.closeFeedsForLocked(db);
-    app.mutex.unlock(app.io);
-
-    app.mutex.lockUncancelable(app.io);
-    defer app.mutex.unlock(app.io);
     if (auth.users_present and !auth.admin) {
-        const db = (try app.getDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
-        if (!db.securityAdmin(auth.user, auth.roles)) return err(res, 403, "forbidden", "Only database admins may delete databases");
+        // The security maps belong to the database lock, not `app.mutex`.
+        const sdb = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+        defer app.releaseDb(sdb);
+        if (!sdb.securityAdmin(auth.user, auth.roles)) return err(res, 403, "forbidden", "Only database admins may delete databases");
     }
+
     const deleted = app.deleteDb(name) catch |e| switch (e) {
         error.DatabaseInUse => return err(res, 409, "conflict", "a replication is using this database; retry when it finishes"),
         else => return e,
@@ -2240,8 +2423,8 @@ fn writeLocal(
     rev: u32,
     body: []const u8,
 ) !void {
-    var full: [512]u8 = undefined;
-    const full_id = std.fmt.bufPrint(&full, "_local/{s}", .{id}) catch id;
+    const full_id = try std.fmt.allocPrint(alloc, "_local/{s}", .{id});
+    defer alloc.free(full_id);
     var rbuf: [32]u8 = undefined;
     const revstr = std.fmt.bufPrint(&rbuf, "0-{d}", .{rev}) catch "0-0";
     try list.append(alloc, '{');
@@ -2322,7 +2505,7 @@ fn hLocalPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const raw_id = req.params.get("id") orelse return err(res, 400, "bad_request", "missing id");
     const id = try canonicalLocalId(res.arena, raw_id);
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
@@ -2337,8 +2520,7 @@ fn hLocalPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         else => return e,
     };
     var l: std.ArrayListUnmanaged(u8) = .empty;
-    var full: [512]u8 = undefined;
-    const full_id = std.fmt.bufPrint(&full, "_local/{s}", .{id}) catch id;
+    const full_id = try std.fmt.allocPrint(res.arena, "_local/{s}", .{id});
     var rbuf: [32]u8 = undefined;
     const revstr = std.fmt.bufPrint(&rbuf, "0-{d}", .{rev}) catch "0-0";
     try l.appendSlice(res.arena, "{\"ok\":true,\"id\":");
@@ -2365,8 +2547,7 @@ fn hLocalDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         else => return e,
     };
     var l: std.ArrayListUnmanaged(u8) = .empty;
-    var full: [512]u8 = undefined;
-    const full_id = std.fmt.bufPrint(&full, "_local/{s}", .{id}) catch id;
+    const full_id = try std.fmt.allocPrint(res.arena, "_local/{s}", .{id});
     var rbuf: [32]u8 = undefined;
     const revstr = std.fmt.bufPrint(&rbuf, "0-{d}", .{next}) catch "0-0";
     try l.appendSlice(res.arena, "{\"ok\":true,\"id\":");
@@ -2388,13 +2569,15 @@ fn hDesignGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn hDesignPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const ddoc = req.params.get("ddoc") orelse return err(res, 400, "bad_request", "missing ddoc");
+    const auth = try requestAuth(app, req, res);
     const id = try std.fmt.allocPrint(res.arena, "_design/{s}", .{ddoc});
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     var root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
+    if (!isDbAdminFor(db, auth)) return err(res, 403, "forbidden", "You are not a db or server admin.");
     const new_edits = if (q(req, "new_edits")) |v| !std.mem.eql(u8, v, "false") else true;
 
     if (!new_edits) {
@@ -2413,13 +2596,14 @@ fn hDesignPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                         if (idv != .string) continue;
                         const g = start -| @as(u32, @intCast(i));
                         const ar = revFromParts(g, idv.string) catch continue;
-                        ancestry_buf.append(res.arena, ar) catch {};
+                        try ancestry_buf.append(res.arena, ar);
                     }
                 }
             }
         }
         if (ancestry_buf.items.len == 0) try ancestry_buf.append(res.arena, rev);
         const result = db.putImported(id, rev, ancestry_buf.items, body, false) catch |e| return e;
+        if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
         var rb: [64]u8 = undefined;
         return okIdRev(res, id, result.rev.write(&rb));
     }
@@ -2436,7 +2620,7 @@ fn hDesignPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 if (d.findLeaf(p)) |idx| parent_leaf = &d.leaves.items[idx];
             }
         }
-        store_body = prepareAttachments(res, &root, parent_leaf) catch |e| switch (e) {
+        store_body = prepareAttachments(res, &root, parent_leaf, app.max_body_bytes) catch |e| switch (e) {
             error.MissingStub => return err(res, 412, "missing_stub", "A pre-existing attachment stub wasn't found"),
             else => return e,
         };
@@ -2446,6 +2630,7 @@ fn hDesignPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
         else => return e,
     };
+    if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
     var rb: [64]u8 = undefined;
     try okIdRev(res, id, result.rev.write(&rb));
 }
@@ -2617,8 +2802,8 @@ fn evalReduceChunk(
         vals_json,
         if (rereduce) "true" else "false",
     });
-    const out = eng.eval(code) catch return error.ReduceFailed;
-    defer std.heap.page_allocator.free(out);
+    const out = eng.eval(alloc, code) catch return error.ReduceFailed;
+    defer alloc.free(out);
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch return error.ReduceFailed;
     return parsed.value;
 }
@@ -2697,7 +2882,10 @@ fn loadViewIndex(
         const keyv = item.object.get("key") orelse continue;
         const valv = item.object.get("value") orelse continue;
         if (idv != .string) continue;
-        rows.append(alloc, .{ .id = idv.string, .key = keyv, .value = valv }) catch return false;
+        rows.append(alloc, .{ .id = idv.string, .key = keyv, .value = valv }) catch {
+            rows.clearRetainingCapacity();
+            return false;
+        };
     }
     last_seq.* = cached_seq;
     return true;
@@ -2738,8 +2926,8 @@ fn mapDocBody(
     rows: *std.ArrayListUnmanaged(ViewRow),
 ) !void {
     const code = try std.fmt.allocPrint(alloc, "var __rows=[];function emit(k,v){{__rows.push([k,v]);}};({s})({s});JSON.stringify(__rows);", .{ map_src, doc_body });
-    const out = eng.eval(code) catch return error.MapFailed;
-    defer std.heap.page_allocator.free(out);
+    const out = eng.eval(alloc, code) catch return error.MapFailed;
+    defer alloc.free(out);
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch return error.MapFailed;
     if (parsed.value != .array) return error.MapFailed;
     for (parsed.value.array.items) |item| {
@@ -2758,32 +2946,67 @@ fn mapDoc(
     return mapDocBody(eng, alloc, map_src, doc.*.id, doc.*.winnerLeaf().body, rows);
 }
 
+fn bodyOrQueryBool(req: *httpz.Request, obj: ?std.json.ObjectMap, key: []const u8, default: bool) bool {
+    if (q(req, key)) |v| return std.mem.eql(u8, v, "true");
+    if (obj) |o| {
+        if (o.get(key)) |v| {
+            if (v == .bool) return v.bool;
+        }
+    }
+    return default;
+}
+
+fn bodyOrQueryUsize(req: *httpz.Request, obj: ?std.json.ObjectMap, key: []const u8, default: usize) usize {
+    if (q(req, key)) |v| return std.fmt.parseInt(usize, v, 10) catch default;
+    if (obj) |o| {
+        if (o.get(key)) |v| {
+            if (v == .integer and v.integer >= 0) return std.math.cast(usize, v.integer) orelse default;
+        }
+    }
+    return default;
+}
+
+fn bodyOrQueryJsonValue(req: *httpz.Request, alloc: std.mem.Allocator, obj: ?std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    if (q(req, key)) |v| return queryJsonValue(alloc, v);
+    if (obj) |o| return o.get(key);
+    return null;
+}
+
 fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const ddoc = req.params.get("ddoc") orelse return err(res, 400, "bad_request", "missing ddoc");
     const view = req.params.get("view") orelse return err(res, 400, "bad_request", "missing view");
     const id = try std.fmt.allocPrint(res.arena, "_design/{s}", .{ddoc});
 
-    const include_docs = if (q(req, "include_docs")) |v| std.mem.eql(u8, v, "true") else false;
-    const descending = if (q(req, "descending")) |v| std.mem.eql(u8, v, "true") else false;
-    const limit: usize = if (q(req, "limit")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else 0;
-    const skip: usize = if (q(req, "skip")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else 0;
-    const group = if (q(req, "group")) |v| std.mem.eql(u8, v, "true") else false;
-    const reduce_opt = if (q(req, "reduce")) |v| std.mem.eql(u8, v, "true") else true;
-    const rereduce_opt = if (q(req, "rereduce")) |v| std.mem.eql(u8, v, "true") else false;
-    const inclusive_end = if (q(req, "inclusive_end")) |v| !std.mem.eql(u8, v, "false") else true;
-    var keys_filter: ?std.json.Value = null;
+    var body_obj: ?std.json.ObjectMap = null;
     if (req.method == .POST) {
-        if (fullBody(req, res.arena) catch null) |b| {
-            const parsed = std.json.parseFromSlice(std.json.Value, res.arena, b, .{}) catch null;
-            if (parsed) |p| {
-                if (p.value == .object) keys_filter = p.value.object.get("keys");
+        if (fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else null) |b| {
+            if (b.len > 0) {
+                const parsed = parseBody(res, b) catch return err(res, 400, "bad_request", "invalid JSON");
+                if (parsed != .object) return err(res, 400, "bad_request", "JSON object required");
+                body_obj = parsed.object;
             }
         }
     }
-    const key_filter = if (q(req, "key")) |v| queryJsonValue(res.arena, v) else null;
-    const startkey = if (q(req, "startkey")) |v| queryJsonValue(res.arena, v) else null;
-    const endkey = if (q(req, "endkey")) |v| queryJsonValue(res.arena, v) else null;
+    const include_docs = bodyOrQueryBool(req, body_obj, "include_docs", false);
+    const descending = bodyOrQueryBool(req, body_obj, "descending", false);
+    const limit: usize = bodyOrQueryUsize(req, body_obj, "limit", 0);
+    const skip: usize = bodyOrQueryUsize(req, body_obj, "skip", 0);
+    const group = bodyOrQueryBool(req, body_obj, "group", false);
+    const reduce_opt = bodyOrQueryBool(req, body_obj, "reduce", true);
+    const rereduce_opt = bodyOrQueryBool(req, body_obj, "rereduce", false);
+    const inclusive_end = bodyOrQueryBool(req, body_obj, "inclusive_end", true);
+    var keys_filter: ?std.json.Value = if (body_obj) |o| o.get("keys") else null;
+    if (keys_filter == null) {
+        if (q(req, "keys")) |kv| {
+            const parsed = std.json.parseFromSlice(std.json.Value, res.arena, kv, .{}) catch
+                return err(res, 400, "bad_request", "invalid keys");
+            keys_filter = parsed.value;
+        }
+    }
+    const key_filter = bodyOrQueryJsonValue(req, res.arena, body_obj, "key");
+    const startkey = bodyOrQueryJsonValue(req, res.arena, body_obj, "startkey");
+    const endkey = bodyOrQueryJsonValue(req, res.arena, body_obj, "endkey");
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
@@ -2831,7 +3054,7 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         const idx_name = try viewIndexName(res.arena, id, view);
         var loaded = false;
         var last_seq: u64 = 0;
-        if (db.readViewIndex(res.arena, idx_name) catch null) |bytes| {
+        if (try db.readViewIndex(res.arena, idx_name)) |bytes| {
             loaded = loadViewIndex(res.arena, bytes, snap_seq, ddoc_rev, &rows, &last_seq);
         }
 
@@ -2844,9 +3067,10 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             while (it.next()) |d| {
                 if (d.*.winnerLeaf().deleted) continue;
                 if (std.mem.startsWith(u8, d.*.id, "_design/")) continue;
+                const js_body = try buildJsDoc(db, res.arena, d.*.id, d.*.winnerLeaf().rev, d.*.winnerLeaf().body, false);
                 try snap_docs.append(res.arena, .{
                     .id = try res.arena.dupe(u8, d.*.id),
-                    .body = try res.arena.dupe(u8, d.*.winnerLeaf().body),
+                    .body = js_body,
                     .deleted = false,
                 });
             }
@@ -2855,9 +3079,10 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             while (it.next()) |d| {
                 if (d.*.seq <= last_seq) continue;
                 const del = d.*.winnerLeaf().deleted;
+                const js_body = if (del) "" else try buildJsDoc(db, res.arena, d.*.id, d.*.winnerLeaf().rev, d.*.winnerLeaf().body, false);
                 try snap_docs.append(res.arena, .{
                     .id = try res.arena.dupe(u8, d.*.id),
-                    .body = if (del) "" else try res.arena.dupe(u8, d.*.winnerLeaf().body),
+                    .body = js_body,
                     .deleted = del,
                 });
             }
@@ -2866,10 +3091,10 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // Release db.mutex during CPU-heavy QuickJS map and sorting so
         // concurrent reads/writes on this DB are not blocked.
         var mutex_held = false;
-        db.mutex.unlock(app.io);
+        db.unlock();
         // `defer`, not `errdefer`: a failed map is reported with a normal
         // `return err(...)`, and the caller's `defer releaseDb` unlocks again.
-        defer if (!mutex_held) db.mutex.lockUncancelable(app.io);
+        defer if (!mutex_held) db.lock();
 
         const task_pid = if (need_build) app.beginTask("indexer", name, id, null, null, null, snap_docs.items.len) else 0;
         defer app.endTask(task_pid);
@@ -2942,7 +3167,7 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             }
         }
 
-        db.mutex.lockUncancelable(app.io);
+        db.lock();
         mutex_held = true;
         if (serialized_idx) |b| {
             if (db.seq == snap_seq) {
@@ -2982,7 +3207,7 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 }
                 if (!any) continue;
             }
-            filtered.append(res.arena, row) catch {};
+            try filtered.append(res.arena, row);
         }
         if (descending) std.mem.reverse(ViewRow, filtered.items);
     }
@@ -3122,9 +3347,9 @@ fn hView(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             try l.append(res.arena, '}');
         }
     } else {
-        const total = view_rows.len;
-        const start = @min(skip, total);
-        var end = total;
+        const total = sorted_rows.len;
+        const start = @min(skip, view_rows.len);
+        var end = view_rows.len;
         if (limit > 0 and end - start > limit) end = start + limit;
 
         try l.appendSlice(res.arena, "{\"total_rows\":");
@@ -3179,10 +3404,11 @@ fn hAttGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const id = try percentDecode(res.arena, req.params.get("doc") orelse return err(res, 400, "bad_request", "missing doc"));
     const att = try percentDecode(res.arena, req.params.get("att") orelse return err(res, 400, "bad_request", "missing attachment"));
-    app.mutex.lockUncancelable(app.io);
+    const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+    // Held until the blob goes out: a plain attachment is streamed with the
+    // database lock released but the handle still pinned.
     var locked = true;
-    defer if (locked) app.mutex.unlock(app.io);
-    const db = (try app.getDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+    defer if (locked) app.releaseDb(db) else app.unpinDb(db);
     const doc = db.get(id) orelse return err(res, 404, "not_found", "missing");
     var li: usize = doc.winner;
     if (q(req, "rev")) |rs| {
@@ -3233,7 +3459,7 @@ fn hAttGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 defer file.close(app.io);
                 // The document's bytes are not needed any more, and holding the
                 // database lock across a whole file would stall every request.
-                app.mutex.unlock(app.io);
+                db.unlock();
                 locked = false;
                 res.headers.add("content-type", ct);
                 res.headers.add("Content-Length", try std.fmt.allocPrint(res.arena, "{d}", .{declared}));
@@ -3251,7 +3477,7 @@ fn hAttGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (ev == .string) {
             // CouchDB decodes compressed attachment storage unless the client asks for gzip.
             if (std.mem.eql(u8, ev.string, "gzip") and !acceptsGzip(req)) {
-                body = gzipDecompress(res.arena, raw) catch |e| switch (e) {
+                body = gzipDecompress(res.arena, raw, app.max_body_bytes) catch |e| switch (e) {
                     error.TooLarge => return err(res, 413, "request_entity_too_large", "attachment too large"),
                     else => return err(res, 500, "internal_error", "invalid gzip attachment"),
                 };
@@ -3266,14 +3492,23 @@ fn hAttGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// Write an already-opened blob to the connection in fixed-size pieces. The
 /// header goes out here because a streamed body cannot go through `res.body`,
 /// and the connection leaves httpz's hands afterwards.
+fn setSocketTimeout(fd: std.posix.socket_t, opt: u32, secs: i64) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const tv: std.posix.timeval = .{ .sec = secs, .usec = 0 };
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&tv)) catch {};
+}
+
 fn sendBlob(app: *App, res: *httpz.Response, file: std.Io.File, len: u64) !void {
     const conn = res.conn;
     const stream = conn.stream;
     // A write this size must not fail halfway through on a non-blocking socket.
     try conn.blockingMode();
+    setSocketTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, 30);
     try res.writeHeader();
     try res.disown();
     defer stream.close(app.io);
+    // Stack safety note (§5.2 #15): ~100 KiB stack buffers; safe on 16 MiB HTTP
+    // workers, never call from the 1 MiB feed scheduler thread.
     var read_buf: [64 * 1024]u8 = undefined;
     var write_buf: [32 * 1024]u8 = undefined;
     var reader = file.reader(app.io, &read_buf);
@@ -3294,13 +3529,37 @@ fn acceptsGzip(req: *httpz.Request) bool {
     return false;
 }
 
-fn gzipDecompress(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
+fn gzipDecodedReaderLen(reader: *std.Io.Reader, max_bytes: usize) !usize {
+    var win_buf: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(reader, .gzip, &win_buf);
+    var d_buf: [4096]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&d_buf);
+    var l_buf: [4096]u8 = undefined;
+    var limited = decompress.reader.limited(.limited(max_bytes), &l_buf);
+    _ = limited.interface.streamRemaining(&discarding.writer) catch return error.BadGzip;
+    if (discarding.fullCount() == max_bytes) {
+        if (decompress.reader.peekByte()) |_| return error.TooLarge else |e| switch (e) {
+            error.EndOfStream => {},
+            error.ReadFailed => return error.BadGzip,
+        }
+    }
+    return @intCast(discarding.fullCount());
+}
+
+fn gzipDecompress(alloc: std.mem.Allocator, data: []const u8, max_bytes: usize) ![]u8 {
     var in: std.Io.Reader = .fixed(data);
     var decompress: flate.Decompress = .init(&in, .gzip, &.{});
     var aw: std.Io.Writer.Allocating = .init(alloc);
     errdefer aw.deinit();
-    _ = try decompress.reader.streamRemaining(&aw.writer);
-    if (aw.writer.end > 64 * 1024 * 1024) return error.TooLarge;
+    var l_buf: [4096]u8 = undefined;
+    var limited = decompress.reader.limited(.limited(max_bytes), &l_buf);
+    _ = try limited.interface.streamRemaining(&aw.writer);
+    if (aw.writer.end == max_bytes) {
+        if (decompress.reader.peekByte()) |_| return error.TooLarge else |e| switch (e) {
+            error.EndOfStream => {},
+            error.ReadFailed => return error.BadGzip,
+        }
+    }
     return aw.toOwnedSlice();
 }
 
@@ -3311,6 +3570,8 @@ fn hAttPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const rs = q(req, "rev") orelse return err(res, 409, "conflict", "Document update conflict.");
     const rev = Rev.parse(rs) catch return err(res, 400, "bad_request", "invalid rev");
     const ct = req.header("content-type") orelse "application/octet-stream";
+    const ce_raw = req.header("content-encoding");
+    const is_gzip = if (ce_raw) |ce| std.ascii.eqlIgnoreCase(std.mem.trim(u8, ce, " \t"), "gzip") else false;
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
@@ -3344,7 +3605,21 @@ fn hAttPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var one: std.json.ObjectMap = .empty;
     try one.put(res.arena, "content_type", .{ .string = ct });
     try one.put(res.arena, "revpos", .{ .integer = @as(i64, rev.gen) + 1 });
-    try one.put(res.arena, "length", .{ .integer = @intCast(upload.len) });
+    if (is_gzip) {
+        const bf = try current_db.openBlob(&upload.hex);
+        defer bf.close(app.io);
+        var b_buf: [8192]u8 = undefined;
+        var br = bf.reader(app.io, &b_buf);
+        const decoded_len = gzipDecodedReaderLen(&br.interface, app.max_body_bytes) catch |e| switch (e) {
+            error.TooLarge => return err(res, 413, "request_entity_too_large", "attachment too large"),
+            error.BadGzip => return err(res, 400, "bad_request", "invalid gzip attachment"),
+        };
+        try one.put(res.arena, "encoding", .{ .string = "gzip" });
+        try one.put(res.arena, "encoded_length", .{ .integer = @intCast(upload.len) });
+        try one.put(res.arena, "length", .{ .integer = @intCast(decoded_len) });
+    } else {
+        try one.put(res.arena, "length", .{ .integer = @intCast(upload.len) });
+    }
     try one.put(res.arena, "digest", .{ .string = try std.fmt.allocPrint(res.arena, "md5-{s}", .{digest}) });
     try one.put(res.arena, "blob", .{ .string = hex });
     try one.put(res.arena, "stub", .{ .bool = true });
@@ -3353,7 +3628,7 @@ fn hAttPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try jsonw.writeValue(&out, res.arena, root_val);
-    if (try validateDoc(current_db, res.arena, id, out.items, oldDocBody(current_db, id))) |reason| return err(res, 403, "forbidden", reason);
+    if (try validateDoc(current_db, res.arena, id, null, out.items, false)) |rej| return sendValidateRejection(res, rej);
     const result = current_db.putLocal(id, out.items, rev, false) catch |e| switch (e) {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
         else => return e,
@@ -3381,7 +3656,7 @@ fn hAttDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try jsonw.writeValue(&out, res.arena, root_val);
-    if (try validateDoc(db, res.arena, id, out.items, oldDocBody(db, id))) |reason| return err(res, 403, "forbidden", reason);
+    if (try validateDoc(db, res.arena, id, null, out.items, false)) |rej| return sendValidateRejection(res, rej);
     const result = db.putLocal(id, out.items, rev, false) catch |e| switch (e) {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
         else => return e,
@@ -3402,6 +3677,17 @@ fn hDocGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const id = try percentDecode(res.arena, req.params.get("doc") orelse return err(res, 400, "bad_request", "missing doc"));
     return docGetById(app, req, res, name, id);
+}
+
+fn etagMatches(if_none_match: ?[]const u8, etag: []const u8) bool {
+    const hdr = if_none_match orelse return false;
+    var it = std.mem.splitScalar(u8, hdr, ',');
+    while (it.next()) |raw| {
+        var part = std.mem.trim(u8, raw, " \t");
+        if (std.mem.startsWith(u8, part, "W/")) part = part[2..];
+        if (std.mem.eql(u8, part, "*") or std.mem.eql(u8, part, etag)) return true;
+    }
+    return false;
 }
 
 fn docGetById(app: *App, req: *httpz.Request, res: *httpz.Response, name: []const u8, id: []const u8) !void {
@@ -3445,8 +3731,8 @@ fn docGetById(app: *App, req: *httpz.Request, res: *httpz.Response, name: []cons
                 var idx: usize = undefined;
                 if (doc.findLeaf(r)) |found| {
                     idx = found;
-                } else if (q(req, "latest") != null and std.mem.eql(u8, q(req, "latest").?, "true")) {
-                    idx = doc.winner;
+                } else if (q(req, "latest") != null and std.mem.eql(u8, q(req, "latest").?, "true") and doc.findDescendantOf(r) != null) {
+                    idx = doc.findDescendantOf(r).?;
                 } else {
                     if (multipart) {
                         try l.appendSlice(res.arena, "--");
@@ -3496,22 +3782,26 @@ fn docGetById(app: *App, req: *httpz.Request, res: *httpz.Response, name: []cons
         }
     }
 
+    const inline_atts = if (q(req, "attachments")) |v| std.mem.eql(u8, v, "true") else false;
     var leaf_idx: usize = doc.winner;
     if (q(req, "rev")) |rs| {
         const r = Rev.parse(rs) catch return err(res, 400, "bad_request", "invalid rev");
         if (doc.findLeaf(r)) |idx| {
             leaf_idx = idx;
         } else if (doc.bodyFor(r)) |stored| {
+            var rb: [64]u8 = undefined;
+            const etag = try std.fmt.allocPrint(res.arena, "\"{s}\"", .{r.write(&rb)});
+            res.headers.add("etag", etag);
+            res.headers.add("cache-control", "must-revalidate");
+            if (etagMatches(req.header("if-none-match"), etag)) {
+                res.status = 304;
+                res.body = "";
+                return;
+            }
             // A revision that stopped being a leaf. CouchDB keeps serving its
-            // body until compaction, and so does this store.
-            var parsed = std.json.parseFromSlice(std.json.Value, res.arena, stored.body, .{}) catch
-                return err(res, 404, "not_found", "missing");
-            if (parsed.value != .object) return err(res, 404, "not_found", "missing");
-            var rbuf: [64]u8 = undefined;
-            try parsed.value.object.put(res.arena, "_id", .{ .string = doc.id });
-            try parsed.value.object.put(res.arena, "_rev", .{ .string = try res.arena.dupe(u8, r.write(&rbuf)) });
+            // cleaned body until compaction, and so does this store.
             var out: std.ArrayListUnmanaged(u8) = .empty;
-            try jsonw.writeValue(&out, res.arena, parsed.value);
+            try writeRetainedDoc(db, res.arena, &out, doc, r, stored.body, stored.deleted, revs, inline_atts);
             res.content_type = .JSON;
             res.body = out.items;
             return;
@@ -3520,8 +3810,18 @@ fn docGetById(app: *App, req: *httpz.Request, res: *httpz.Response, name: []cons
         return err(res, 404, "not_found", "deleted");
     }
 
+    var etag_rb: [64]u8 = undefined;
+    const etag = try std.fmt.allocPrint(res.arena, "\"{s}\"", .{doc.leaves.items[leaf_idx].rev.write(&etag_rb)});
+    res.headers.add("etag", etag);
+    res.headers.add("cache-control", "must-revalidate");
+    if (etagMatches(req.header("if-none-match"), etag)) {
+        res.status = 304;
+        res.body = "";
+        return;
+    }
+
     var l: std.ArrayListUnmanaged(u8) = .empty;
-    try writeDoc(db, &l, res.arena, doc, leaf_idx, revs, conflicts, if (q(req, "attachments")) |v| std.mem.eql(u8, v, "true") else false);
+    try writeDoc(db, &l, res.arena, doc, leaf_idx, revs, conflicts, inline_atts);
     if (q(req, "revs_info")) |v| {
         if (std.mem.eql(u8, v, "true")) {
             // writeDoc has just emitted one complete object, so the array goes in
@@ -3562,6 +3862,7 @@ fn prepareAttachments(
     res: *httpz.Response,
     root: *std.json.Value,
     parent: ?*const Leaf,
+    max_bytes: usize,
 ) ![]u8 {
     const atts_ptr = root.object.getPtr("_attachments") orelse return error.MissingStub;
     if (atts_ptr.* != .object) return error.MissingStub;
@@ -3595,7 +3896,7 @@ fn prepareAttachments(
                 if (pa.object.get("blob")) |pb| {
                     if (pb != .string) return error.MissingStub;
                     try one.put(res.arena, "blob", pb);
-                    for ([_][]const u8{ "length", "digest", "encoding" }) |key| {
+                    for ([_][]const u8{ "length", "digest", "encoding", "encoded_length" }) |key| {
                         if (pa.object.get(key)) |mv| try one.put(res.arena, key, mv);
                     }
                 } else return error.MissingStub;
@@ -3609,6 +3910,27 @@ fn prepareAttachments(
             try one.put(res.arena, "content_type", ct);
             const gen: i64 = if (parent) |pl| @as(i64, pl.rev.gen) + 1 else 1;
             try one.put(res.arena, "revpos", .{ .integer = gen });
+            if (av.object.get("encoding")) |ev| {
+                if (ev == .string) {
+                    try one.put(res.arena, "encoding", ev);
+                    if (data_v.? == .string) {
+                        const raw_len = std.base64.standard.Decoder.calcSizeForSlice(data_v.?.string) catch 0;
+                        const raw = try res.arena.alloc(u8, raw_len);
+                        if (std.base64.standard.Decoder.decode(raw, data_v.?.string)) |_| {
+                            try one.put(res.arena, "encoded_length", .{ .integer = @intCast(raw.len) });
+                            if (av.object.get("length")) |lv| {
+                                if (lv == .integer and lv.integer >= 0) {
+                                    try one.put(res.arena, "length", lv);
+                                }
+                            } else if (std.mem.eql(u8, ev.string, "gzip")) {
+                                var r_in: std.Io.Reader = .fixed(raw);
+                                const decoded_len = try gzipDecodedReaderLen(&r_in, max_bytes);
+                                try one.put(res.arena, "length", .{ .integer = @intCast(decoded_len) });
+                            }
+                        } else |_| {}
+                    }
+                }
+            }
         }
         try out.put(res.arena, name, .{ .object = one });
     }
@@ -3858,14 +4180,147 @@ fn parseMultipartRelated(
     return out.items;
 }
 
-fn oldDocBody(db: *Db, id: []const u8) ?[]const u8 {
-    const doc = db.get(id) orelse return null;
-    return doc.leaves.items[doc.winner].body;
+fn isDbAdminFor(db: *const Db, auth: RequestAuth) bool {
+    if (!db.securityRestricted() or !auth.users_present) return true;
+    return auth.admin or db.securityAdmin(auth.user, auth.roles);
 }
 
-/// Evaluate every design document's validate_doc_update for a local write.
-/// Returns a rejection reason, or null when the write is allowed.
-fn validateDoc(db: *Db, alloc: std.mem.Allocator, id: []const u8, new_body: []const u8, old_body: ?[]const u8) !?[]const u8 {
+fn buildQueryJson(alloc: std.mem.Allocator, req: *httpz.Request) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    const qs = req.query() catch {
+        try out.append(alloc, '}');
+        return out.toOwnedSlice(alloc);
+    };
+    for (0..qs.len) |i| {
+        if (i != 0) try out.append(alloc, ',');
+        try jsonw.writeString(&out, alloc, qs.keys[i]);
+        try out.append(alloc, ':');
+        try jsonw.writeString(&out, alloc, qs.values[i]);
+    }
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+fn appendCleanAttStub(
+    db: *Db,
+    clean: *std.json.ObjectMap,
+    aa: std.mem.Allocator,
+    att_name: []const u8,
+    av: std.json.Value,
+    default_revpos: u32,
+) !void {
+    if (av != .object) return;
+    var stub: std.json.ObjectMap = .empty;
+    const ct = if (av.object.get("content_type")) |cv| (if (cv == .string) cv.string else "application/octet-stream") else "application/octet-stream";
+    try stub.put(aa, "content_type", .{ .string = ct });
+    const revpos: u32 = if (av.object.get("revpos")) |rv|
+        (if (rv == .integer and rv.integer > 0) (std.math.cast(u32, rv.integer) orelse default_revpos) else default_revpos)
+    else
+        default_revpos;
+    try stub.put(aa, "revpos", .{ .integer = revpos });
+
+    if (av.object.get("digest")) |dv| {
+        if (dv == .string) try stub.put(aa, "digest", dv);
+    }
+    if (av.object.get("length")) |lv| {
+        if (lv == .integer) try stub.put(aa, "length", lv);
+    }
+    if (stub.get("digest") == null or stub.get("length") == null) {
+        if (try attachmentRaw(db, aa, av)) |raw| {
+            if (stub.get("digest") == null) {
+                var digest: [16]u8 = undefined;
+                std.crypto.hash.Md5.hash(raw, &digest, .{});
+                var dbuf: [24]u8 = undefined;
+                _ = std.base64.standard.Encoder.encode(&dbuf, &digest);
+                try stub.put(aa, "digest", .{ .string = try std.fmt.allocPrint(aa, "md5-{s}", .{dbuf}) });
+            }
+            if (stub.get("length") == null) {
+                try stub.put(aa, "length", .{ .integer = @intCast(raw.len) });
+            }
+        }
+    }
+    if (av.object.get("encoding")) |ev| {
+        if (ev == .string) {
+            try stub.put(aa, "encoding", ev);
+            if (av.object.get("encoded_length")) |elv| {
+                if (elv == .integer) try stub.put(aa, "encoded_length", elv);
+            }
+        }
+    }
+    try stub.put(aa, "stub", .{ .bool = true });
+    try clean.put(aa, att_name, .{ .object = stub });
+}
+
+/// Build the clean document JSON object exposed to JS (map, filter, validate_doc_update):
+/// includes `_id`, `_rev`, `_deleted` (if true), user fields, and clean `_attachments` stubs.
+fn buildJsDoc(
+    db: *Db,
+    alloc: std.mem.Allocator,
+    doc_id: []const u8,
+    rev: ?Rev,
+    body: []const u8,
+    deleted: bool,
+) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const aa = arena_state.allocator();
+
+    var root: std.json.Value = if (std.json.parseFromSlice(std.json.Value, aa, body, .{})) |p|
+        (if (p.value == .object) p.value else .{ .object = .empty })
+    else |_|
+        .{ .object = .empty };
+
+    try root.object.put(aa, "_id", .{ .string = doc_id });
+    if (rev) |r| {
+        var rbuf: [64]u8 = undefined;
+        try root.object.put(aa, "_rev", .{ .string = try aa.dupe(u8, r.write(&rbuf)) });
+    }
+    if (deleted) {
+        try root.object.put(aa, "_deleted", .{ .bool = true });
+    }
+    if (root.object.get("_attachments")) |atts| {
+        if (atts == .object) {
+            var clean: std.json.ObjectMap = .empty;
+            const gen: u32 = if (rev) |r| r.gen else 1;
+            for (atts.object.keys(), atts.object.values()) |att_name, av| {
+                try appendCleanAttStub(db, &clean, aa, att_name, av, gen);
+            }
+            if (clean.count() > 0) {
+                try root.object.put(aa, "_attachments", .{ .object = clean });
+            } else {
+                _ = root.object.orderedRemove("_attachments");
+            }
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try jsonw.writeValue(&out, alloc, root);
+    return out.toOwnedSlice(alloc);
+}
+
+const ValidateRejection = struct {
+    status: u16,
+    code: []const u8,
+    reason: []const u8,
+};
+
+fn sendValidateRejection(res: *httpz.Response, rej: ValidateRejection) !void {
+    return err(res, rej.status, rej.code, rej.reason);
+}
+
+/// Evaluate every design document's validate_doc_update.
+/// Returns a rejection descriptor (401/403), or null when the write is allowed.
+fn validateDoc(
+    db: *Db,
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    new_rev: ?Rev,
+    new_body: []const u8,
+    new_deleted: bool,
+) !?ValidateRejection {
     if (std.mem.startsWith(u8, id, "_design/")) return null;
 
     var found = false;
@@ -3877,7 +4332,9 @@ fn validateDoc(db: *Db, alloc: std.mem.Allocator, id: []const u8, new_body: []co
         const did = did_ptr.*;
         const ddoc = db.get(did) orelse continue;
         const leaf = ddoc.leaves.items[ddoc.winner];
+        if (leaf.deleted) continue;
         const parsed = std.json.parseFromSlice(std.json.Value, alloc, leaf.body, .{}) catch continue;
+        defer parsed.deinit();
         if (parsed.value != .object) continue;
         const fn_v = parsed.value.object.get("validate_doc_update") orelse continue;
         if (fn_v != .string) continue;
@@ -3890,10 +4347,21 @@ fn validateDoc(db: *Db, alloc: std.mem.Allocator, id: []const u8, new_body: []co
         try code.appendSlice(alloc, fn_v.string);
     }
     if (!found) return null;
+
+    const nd_json = try buildJsDoc(db, alloc, id, new_rev, new_body, new_deleted);
+    defer alloc.free(nd_json);
+    const od_json: ?[]u8 = if (db.get(id)) |old_doc| blk: {
+        const old_leaf = old_doc.winnerLeaf();
+        break :blk try buildJsDoc(db, alloc, id, old_leaf.rev, old_leaf.body, old_leaf.deleted);
+    } else null;
+    defer if (od_json) |o| alloc.free(o);
+    const sec_json = db.readSecurity(alloc) catch try alloc.dupe(u8, "{}");
+    defer alloc.free(sec_json);
+
     try code.appendSlice(alloc, "];var nd=");
-    try code.appendSlice(alloc, new_body);
+    try code.appendSlice(alloc, nd_json);
     try code.appendSlice(alloc, ";var od=");
-    if (old_body) |ob| try code.appendSlice(alloc, ob) else try code.appendSlice(alloc, "null");
+    if (od_json) |ob| try code.appendSlice(alloc, ob) else try code.appendSlice(alloc, "null");
     try code.appendSlice(alloc, ";var uc={name:");
     if (validate_user.len > 0) {
         try jsonw.writeString(&code, alloc, validate_user);
@@ -3913,19 +4381,32 @@ fn validateDoc(db: *Db, alloc: std.mem.Allocator, id: []const u8, new_body: []co
         first_role = false;
         try jsonw.writeString(&code, alloc, role);
     }
-    try code.appendSlice(alloc, "]};for(var i=0;i<fns.length;i++){try{fns[i](nd,od,uc,{});}catch(e){return JSON.stringify({ok:false,reason:String(e.forbidden||e.message||e)});}}return JSON.stringify({ok:true});})()");
+    try code.appendSlice(alloc, "]};var sec=");
+    try code.appendSlice(alloc, sec_json);
+    try code.appendSlice(alloc, ";for(var i=0;i<fns.length;i++){try{fns[i](nd,od,uc,sec);}catch(e){if(e&&e.unauthorized!==undefined)return JSON.stringify({ok:false,unauth:true,reason:String(e.unauthorized)});return JSON.stringify({ok:false,reason:String(e.forbidden||e.message||e)});}}return JSON.stringify({ok:true});})()");
 
-    var eng = qjs.Engine.init() catch return "validation engine unavailable";
+    var eng = qjs.Engine.init() catch return .{ .status = 403, .code = "forbidden", .reason = "validation engine unavailable" };
     defer eng.deinit();
-    const out = eng.eval(code.items) catch return "validation function failed";
-    defer std.heap.page_allocator.free(out);
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch return "validation function returned invalid output";
-    if (parsed.value != .object) return "validation function returned invalid output";
-    const ok_v = parsed.value.object.get("ok") orelse return "validation function returned invalid output";
+    const out = eng.eval(alloc, code.items) catch return .{ .status = 403, .code = "forbidden", .reason = "validation function failed" };
+    defer alloc.free(out);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch return .{ .status = 403, .code = "forbidden", .reason = "validation function returned invalid output" };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .status = 403, .code = "forbidden", .reason = "validation function returned invalid output" };
+    const ok_v = parsed.value.object.get("ok") orelse return .{ .status = 403, .code = "forbidden", .reason = "validation function returned invalid output" };
     if (ok_v == .bool and ok_v.bool) return null;
+    const is_unauth = if (parsed.value.object.get("unauth")) |uv| (uv == .bool and uv.bool) else false;
     const reason_v = parsed.value.object.get("reason");
-    if (reason_v != null and reason_v.? == .string) return reason_v.?.string;
-    return "forbidden";
+    const reason_copy = if (reason_v != null and reason_v.? == .string)
+        try alloc.dupe(u8, reason_v.?.string)
+    else if (is_unauth)
+        "unauthorized"
+    else
+        "forbidden";
+    return .{
+        .status = if (is_unauth) 401 else 403,
+        .code = if (is_unauth) "unauthorized" else "forbidden",
+        .reason = reason_copy,
+    };
 }
 
 const ParsedSource = struct { url: []const u8, user: ?[]const u8, password: ?[]const u8 };
@@ -3941,21 +4422,25 @@ fn parseSourceUrl(raw: []const u8) ParsedSource {
     return .{ .url = raw, .user = userinfo[0..colon], .password = userinfo[colon + 1 ..] };
 }
 
-/// The server owns a single mutex for every database. A replication passes this
-/// pair down so it can drop the lock while it waits on the network and take it
-/// back for each database touch: otherwise one pull of a large database freezes
-/// every other request for its whole duration. The database is pinned by the
-/// caller for the length of the transfer, so the handle cannot be freed while
-/// the lock is released.
+/// Every database has its own mutex (`Db.mutex`), taken by every thread that
+/// touches that database's state. A replication passes this pair down so it can
+/// drop the lock while it waits on the network and take it back for each
+/// touch of the database it writes (or, for a push, reads): otherwise one pull
+/// of a large database freezes every other request on it for the whole copy.
+/// The context is the `*Db`. The database is pinned by the caller for the
+/// length of the transfer, so the handle cannot be freed while the lock is
+/// released. Lock order: `feed_mutex`, then `app.mutex` or `db.mutex`;
+/// `app.mutex` is never held while waiting for a `db.mutex`, and a thread
+/// holds at most one `db.mutex` at a time.
 const ReplLock = struct {
     fn lockFn(ctx: ?*anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(ctx.?));
-        app.mutex.lockUncancelable(app.io);
+        const db: *Db = @ptrCast(@alignCast(ctx.?));
+        db.lock();
     }
 
     fn unlockFn(ctx: ?*anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(ctx.?));
-        app.mutex.unlock(app.io);
+        const db: *Db = @ptrCast(@alignCast(ctx.?));
+        db.unlock();
     }
 };
 
@@ -3982,6 +4467,7 @@ fn appendReplicationHistory(
     session_id: []const u8,
     docs_read: usize,
     docs_written: usize,
+    doc_write_failures: usize,
     missing_checked: usize,
     missing_found: usize,
     start_seq: ?[]const u8,
@@ -3993,7 +4479,9 @@ fn appendReplicationHistory(
     try appendInt(l, alloc, docs_read);
     try l.appendSlice(alloc, ",\"docs_written\":");
     try appendInt(l, alloc, docs_written);
-    try l.appendSlice(alloc, ",\"doc_write_failures\":0,\"missing_checked\":");
+    try l.appendSlice(alloc, ",\"doc_write_failures\":");
+    try appendInt(l, alloc, doc_write_failures);
+    try l.appendSlice(alloc, ",\"missing_checked\":");
     try appendInt(l, alloc, missing_checked);
     try l.appendSlice(alloc, ",\"missing_found\":");
     try appendInt(l, alloc, missing_found);
@@ -4004,8 +4492,8 @@ fn appendReplicationHistory(
     try l.appendSlice(alloc, "}]");
 }
 
-fn replGuard(app: *App) replicator.Guard {
-    return .{ .lock = ReplLock.lockFn, .unlock = ReplLock.unlockFn, .ctx = app };
+fn replGuard(db: *Db) replicator.Guard {
+    return .{ .lock = ReplLock.lockFn, .unlock = ReplLock.unlockFn, .ctx = db };
 }
 
 const EndpointSpec = struct {
@@ -4071,7 +4559,7 @@ fn parseEndpoint(alloc: std.mem.Allocator, val: std.json.Value) !EndpointSpec {
 fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const auth = try requestAuth(app, req, res);
     if (auth.users_present and !auth.admin) return err(res, 403, "forbidden", "Only _admin users may replicate");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const source_v = root.object.get("source") orelse return err(res, 400, "bad_request", "missing source");
@@ -4130,10 +4618,9 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (!source_is_url) {
             // A local source is matched here, then copied through the doc_ids
             // path, which every branch already honours.
-            app.mutex.lockUncancelable(app.io);
-            defer app.mutex.unlock(app.io);
-            const sdb = (try app.getDb(source_ep.raw_url)) orelse
+            const sdb = (try app.acquireDb(source_ep.raw_url)) orelse
                 return err(res, 404, "not_found", "Database does not exist.");
+            defer app.releaseDb(sdb);
             var sit = sdb.docs.valueIterator();
             while (sit.next()) |d| {
                 var doc_parsed = std.json.parseFromSlice(std.json.Value, res.arena, d.*.winnerLeaf().body, .{}) catch continue;
@@ -4164,11 +4651,16 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (filter_value) |spec| {
         if (!source_is_url) {
             if (doc_ids_ptr != null) return err(res, 400, "bad_request", "doc_ids and filter are mutually exclusive");
-            app.mutex.lockUncancelable(app.io);
-            defer app.mutex.unlock(app.io);
-            const sdb = (try app.getDb(source_ep.raw_url)) orelse
+            const sdb = (try app.acquireDb(source_ep.raw_url)) orelse
                 return err(res, 404, "not_found", "Database does not exist.");
-            const ids = buildFilterIds(sdb, res.arena, spec, 0) catch |e| switch (e) {
+            defer app.releaseDb(sdb);
+            var qp_json: ?[]const u8 = null;
+            if (root.object.get("query_params")) |qv| {
+                var qb: std.ArrayListUnmanaged(u8) = .empty;
+                try jsonw.writeValue(&qb, res.arena, qv);
+                qp_json = qb.items;
+            }
+            const ids = buildFilterIds(sdb, res.arena, spec, 0, qp_json) catch |e| switch (e) {
                 error.FilterNotFound => return err(res, 404, "not_found", "missing filter"),
                 error.FilterError => return err(res, 500, "filter_error", "filter function failed"),
                 else => return e,
@@ -4185,21 +4677,18 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         cancel_hash.update("\x00");
         cancel_hash.update(target_ep.raw_url);
         const cancel_id = try std.fmt.allocPrint(res.arena, "repl-{x}", .{cancel_hash.final()});
-        app.mutex.lockUncancelable(app.io);
-        const rdb = (try app.getDb("_replicator")) orelse {
-            app.mutex.unlock(app.io);
+        const rdb = (try app.acquireDb("_replicator")) orelse
             return err(res, 500, "internal_error", "_replicator is missing");
-        };
         const doc = rdb.docs.get(cancel_id);
         // A cancelled job leaves a tombstone behind, and cancelling twice should
         // not report success for a job that is already gone.
         if (doc == null or doc.?.winnerLeaf().deleted) {
-            app.mutex.unlock(app.io);
+            app.releaseDb(rdb);
             return err(res, 404, "not_found", "no continuous replication for that source and target");
         }
         const parent: Rev = doc.?.winnerLeaf().rev;
         const stored = rdb.putLocal(cancel_id, "{}", parent, true);
-        app.mutex.unlock(app.io);
+        app.releaseDb(rdb);
         _ = stored catch |e| return err(res, 500, "internal_error", @errorName(e));
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(res.arena, "{\"ok\":true,\"_local_id\":");
@@ -4241,15 +4730,32 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             try job_body.appendSlice(res.arena, ",\"selector\":");
             try job_body.appendSlice(res.arena, sel);
         }
+        if (root.object.get("worker_batch_size")) |v| {
+            try job_body.appendSlice(res.arena, ",\"worker_batch_size\":");
+            try jsonw.writeValue(&job_body, res.arena, v);
+        }
+        if (root.object.get("use_checkpoints")) |v| {
+            try job_body.appendSlice(res.arena, ",\"use_checkpoints\":");
+            try jsonw.writeValue(&job_body, res.arena, v);
+        }
+        if (root.object.get("since_seq")) |v| {
+            try job_body.appendSlice(res.arena, ",\"since_seq\":");
+            try jsonw.writeValue(&job_body, res.arena, v);
+        }
+        if (root.object.get("create_target")) |v| {
+            try job_body.appendSlice(res.arena, ",\"create_target\":");
+            try jsonw.writeValue(&job_body, res.arena, v);
+        }
+        if (root.object.get("query_params")) |v| {
+            try job_body.appendSlice(res.arena, ",\"query_params\":");
+            try jsonw.writeValue(&job_body, res.arena, v);
+        }
         try job_body.append(res.arena, '}');
-        app.mutex.lockUncancelable(app.io);
-        const rdb = (try app.getDb("_replicator")) orelse {
-            app.mutex.unlock(app.io);
+        const rdb = (try app.acquireDb("_replicator")) orelse
             return err(res, 500, "internal_error", "_replicator is missing");
-        };
         const parent: ?Rev = if (rdb.docs.get(job_id)) |d| d.winnerLeaf().rev else null;
         const stored = rdb.putLocal(job_id, job_body.items, parent, false);
-        app.mutex.unlock(app.io);
+        app.releaseDb(rdb);
         _ = stored catch |e| return err(res, 500, "internal_error", @errorName(e));
         var out: std.ArrayListUnmanaged(u8) = .empty;
         try out.appendSlice(res.arena, "{\"ok\":true,\"_local_id\":");
@@ -4289,7 +4795,7 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             error.DatabaseInUse => return err(res, 409, "conflict", "a replication is already using this database"),
             else => return e,
         };
-        defer app.unpinDb(db);
+        defer app.unpinReplication(db);
         var diag: replicator.Diag = .{ .alloc = app.alloc };
         defer diag.deinit();
         const result = replicator.pushIntoWithOptions(app.alloc, app.io, db, .{
@@ -4297,7 +4803,7 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             .username = target_ep.user,
             .password = target_ep.password,
             .diag = &diag,
-            .guard = replGuard(app),
+            .guard = replGuard(db),
             .doc_ids = doc_ids_ptr,
             .use_checkpoints = use_checkpoints,
             .worker_batch_size = page_size,
@@ -4313,7 +4819,9 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try appendInt(&l, res.arena, result.pushed);
         try l.appendSlice(res.arena, ",\"checked\":");
         try appendInt(&l, res.arena, result.checked);
-        try appendReplicationHistory(&l, res.arena, &session_id, result.pushed, result.pushed, result.checked, result.pushed, null, result.end_seq);
+        try l.appendSlice(res.arena, ",\"doc_write_failures\":");
+        try appendInt(&l, res.arena, result.failed);
+        try appendReplicationHistory(&l, res.arena, &session_id, result.pushed + result.failed, result.pushed, result.failed, result.checked, result.pushed + result.failed, null, result.end_seq);
         try l.append(res.arena, '}');
         if (result.end_seq) |seq| app.alloc.free(seq);
     } else {
@@ -4325,7 +4833,7 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             error.DatabaseInUse => return err(res, 409, "conflict", "a replication is already using this database"),
             else => return e,
         };
-        defer app.unpinDb(db);
+        defer app.unpinReplication(db);
         const filter: ?[]const u8 = if (root.object.get("filter")) |fv| blk: {
             if (fv != .string) return err(res, 400, "bad_request", "filter must be a string");
             break :blk fv.string;
@@ -4340,6 +4848,8 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 .use_checkpoints = use_checkpoints,
                 .source = source_ep.clean_url,
                 .target_path = "",
+                .checkpoint_target = try std.fmt.allocPrint(res.arena, "{s}:{s}", .{ target_ep.raw_url, &db.uuid }),
+                .max_attachment_bytes = app.max_body_bytes,
                 .username = source_ep.user,
                 .password = source_ep.password,
                 .filter = filter,
@@ -4349,7 +4859,7 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 .diag = &diag,
                 .lock = ReplLock.lockFn,
                 .unlock = ReplLock.unlockFn,
-                .lock_ctx = app,
+                .lock_ctx = db,
             }) catch |e| return replicationError(res, e, &diag)
         else blk: {
             const src = app.pinDb(source_ep.raw_url) catch |e| switch (e) {
@@ -4357,7 +4867,7 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 error.DatabaseInUse => return err(res, 409, "conflict", "a replication is already using this database"),
                 else => return e,
             };
-            defer app.unpinDb(src);
+            defer app.unpinReplication(src);
             break :blk replicator.pullLocal(app.alloc, src, db, .{
                 .page_size = page_size,
                 .use_checkpoints = use_checkpoints,
@@ -4366,9 +4876,11 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 .diag = &diag,
                 .lock = ReplLock.lockFn,
                 .unlock = ReplLock.unlockFn,
-                .lock_ctx = app,
+                .lock_ctx = db,
+                .source_guard = replGuard(src),
             }) catch |e| return replicationError(res, e, &diag);
         };
+        if (std.mem.eql(u8, target_ep.raw_url, "_users")) app.invalidateUsersCache();
         try l.appendSlice(res.arena, "{\"ok\":true,\"session_id\":");
         try jsonw.writeString(&l, res.arena, &session_id);
         try l.appendSlice(res.arena, ",\"source_last_seq\":");
@@ -4377,7 +4889,9 @@ fn hReplicate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try appendInt(&l, res.arena, result.documents);
         try l.appendSlice(res.arena, ",\"changes_seen\":");
         try appendInt(&l, res.arena, result.changes_seen);
-        try appendReplicationHistory(&l, res.arena, &session_id, result.documents, result.documents, result.changes_seen, result.documents, result.start_seq, result.end_seq);
+        try l.appendSlice(res.arena, ",\"doc_write_failures\":");
+        try appendInt(&l, res.arena, result.doc_write_failures);
+        try appendReplicationHistory(&l, res.arena, &session_id, result.documents, result.documents, result.doc_write_failures, result.changes_seen, result.documents, result.start_seq, result.end_seq);
         try l.append(res.arena, '}');
         if (result.start_seq) |seq| app.alloc.free(seq);
         if (result.end_seq) |seq| app.alloc.free(seq);
@@ -4478,6 +4992,12 @@ fn requestAuth(app: *App, req: *httpz.Request, res: *httpz.Response) !RequestAut
         }
     }
 
+    if (!try app.hasUsersPresent()) return .{
+        .authenticated = !has_auth_db,
+        .admin = !has_auth_db,
+        .users_present = has_auth_db,
+    };
+
     const udb = (try app.acquireDb("_users")) orelse return .{
         .authenticated = !has_auth_db,
         .admin = !has_auth_db,
@@ -4506,7 +5026,7 @@ fn requestAuth(app: *App, req: *httpz.Request, res: *httpz.Response) !RequestAut
 }
 
 fn hUserCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const name_v = root.object.get("name") orelse return err(res, 400, "bad_request", "missing name");
@@ -4524,6 +5044,8 @@ fn hUserCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (rv != .array) return err(res, 400, "bad_request", "roles must be an array");
         for (rv.array.items) |item| {
             if (item != .string) return err(res, 400, "bad_request", "roles must be strings");
+            if (std.mem.indexOfScalar(u8, item.string, ',') != null)
+                return err(res, 400, "bad_request", "role names must not contain ','");
             try roles.append(item);
         }
     }
@@ -4545,7 +5067,7 @@ fn hUserCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         };
         created.pins += 1;
         app.mutex.unlock(app.io);
-        created.mutex.lockUncancelable(app.io);
+        created.lock();
         break :blk created;
     };
     defer app.releaseDb(db);
@@ -4563,6 +5085,7 @@ fn hUserCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         db.failed = true;
         return e;
     };
+    app.invalidateUsersCache();
     var revbuf: [64]u8 = undefined;
     var l: std.ArrayListUnmanaged(u8) = .empty;
     try l.appendSlice(res.arena, "{\"ok\":true,\"id\":");
@@ -4578,8 +5101,10 @@ fn hUserCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     if (!try requireReplicatorAdmin(app, req, res, name)) return;
+    const auth = try requestAuth(app, req, res);
     const id = try percentDecode(res.arena, req.params.get("doc") orelse return err(res, 400, "bad_request", "missing doc"));
-    const raw_body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    if (!validDocId(id)) return err(res, 400, "bad_request", "Only reserved document ids may start with underscore.");
+    const raw_body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const ctype = req.header("content-type") orelse "";
     const multipart = std.mem.startsWith(u8, ctype, "multipart/related");
     const body = if (multipart)
@@ -4613,6 +5138,9 @@ fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
+    if (std.mem.startsWith(u8, id, "_design/") and !isDbAdminFor(db, auth)) {
+        return err(res, 403, "forbidden", "You are not a db or server admin.");
+    }
 
     if (!new_edits) {
         const rv = root.object.get("_rev") orelse return err(res, 400, "bad_request", "missing rev");
@@ -4630,7 +5158,7 @@ fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                         if (idv != .string) continue;
                         const g = start -| @as(u32, @intCast(i));
                         const ar = revFromParts(g, idv.string) catch continue;
-                        ancestry_buf.append(res.arena, ar) catch {};
+                        try ancestry_buf.append(res.arena, ar);
                     }
                 }
             }
@@ -4638,8 +5166,9 @@ fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (ancestry_buf.items.len == 0) try ancestry_buf.append(res.arena, rev);
         const deleted = if (root.object.get("_deleted")) |dv| (dv == .bool and dv.bool) else false;
         const store_body = try externalizeBody(db, res.arena, body);
-        if (try validateDoc(db, res.arena, id, store_body, oldDocBody(db, id))) |reason| return err(res, 403, "forbidden", reason);
+        if (try validateDoc(db, res.arena, id, rev, store_body, deleted)) |rej| return sendValidateRejection(res, rej);
         const result = db.putImported(id, rev, ancestry_buf.items, store_body, deleted) catch |e| return e;
+        if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
         var rb: [64]u8 = undefined;
         return okIdRev(res, id, result.rev.write(&rb));
     }
@@ -4684,19 +5213,20 @@ fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 if (d.findLeaf(p)) |idx| parent_leaf = &d.leaves.items[idx];
             }
         }
-        store_body = prepareAttachments(res, &root, parent_leaf) catch |e| switch (e) {
+        store_body = prepareAttachments(res, &root, parent_leaf, app.max_body_bytes) catch |e| switch (e) {
             error.MissingStub => return err(res, 412, "missing_stub", "A pre-existing attachment stub wasn't found"),
             else => return e,
         };
         store_body = try externalizeBody(db, res.arena, store_body);
     }
 
-    if (try validateDoc(db, res.arena, id, store_body, oldDocBody(db, id))) |reason| return err(res, 403, "forbidden", reason);
+    if (try validateDoc(db, res.arena, id, parent, store_body, deleted)) |rej| return sendValidateRejection(res, rej);
     const result = db.putLocal(id, store_body, parent, deleted) catch |e| switch (e) {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
         error.InvalidRev => return err(res, 400, "bad_request", "invalid rev"),
         else => return e,
     };
+    if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
     var rb: [64]u8 = undefined;
     try okIdRev(res, id, result.rev.write(&rb));
 }
@@ -4704,6 +5234,7 @@ fn hDocPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn hDocDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     if (!try requireReplicatorAdmin(app, req, res, name)) return;
+    const auth = try requestAuth(app, req, res);
     const id = try percentDecode(res.arena, req.params.get("doc") orelse return err(res, 400, "bad_request", "missing doc"));
     // CouchDB accepts the revision to delete as `?rev=` or an `If-Match`
     // header, the same pair a PUT takes.
@@ -4712,11 +5243,15 @@ fn hDocDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
-    if (try validateDoc(db, res.arena, id, "{\"_deleted\":true}", oldDocBody(db, id))) |reason| return err(res, 403, "forbidden", reason);
+    if (std.mem.startsWith(u8, id, "_design/") and !isDbAdminFor(db, auth)) {
+        return err(res, 403, "forbidden", "You are not a db or server admin.");
+    }
+    if (try validateDoc(db, res.arena, id, rev, "{\"_deleted\":true}", true)) |rej| return sendValidateRejection(res, rej);
     const result = db.putLocal(id, "{\"_deleted\":true}", rev, true) catch |e| switch (e) {
         error.Conflict => return err(res, 409, "conflict", "Document update conflict."),
         else => return e,
     };
+    if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
     var rb: [64]u8 = undefined;
     res.status = 200;
     res.content_type = .JSON;
@@ -4742,7 +5277,13 @@ fn revFromParts(gen: u32, hash: []const u8) !Rev {
 fn hBulkDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     if (!try requireReplicatorAdmin(app, req, res, name)) return;
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const auth = try requestAuth(app, req, res);
+    if (req.header("content-type")) |ct_hdr| {
+        if (!std.mem.startsWith(u8, ct_hdr, "application/json") and !std.mem.startsWith(u8, ct_hdr, "multipart/")) {
+            return err(res, 415, "bad_content_type", "Content-Type must be application/json");
+        }
+    }
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const ctype = req.header("content-type") orelse "application/json";
 
     var docs: []std.json.Value = &.{};
@@ -4803,6 +5344,23 @@ fn hBulkDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             break :blk &generated_id;
         };
 
+        if (!validDocId(id)) {
+            if (!first) try out.append(res.arena, ',');
+            first = false;
+            try out.appendSlice(res.arena, "{\"id\":");
+            try jsonw.writeString(&out, res.arena, id);
+            try out.appendSlice(res.arena, ",\"error\":\"bad_request\",\"reason\":\"Only reserved document ids may start with underscore.\"}");
+            continue;
+        }
+        if (std.mem.startsWith(u8, id, "_design/") and !isDbAdminFor(db, auth)) {
+            if (!first) try out.append(res.arena, ',');
+            first = false;
+            try out.appendSlice(res.arena, "{\"id\":");
+            try jsonw.writeString(&out, res.arena, id);
+            try out.appendSlice(res.arena, ",\"error\":\"forbidden\",\"reason\":\"You are not a db or server admin.\"}");
+            continue;
+        }
+
         var doc_val = item;
         if (std.mem.eql(u8, name, "_users")) {
             validateUserDoc(doc_val, id) catch {
@@ -4825,6 +5383,11 @@ fn hBulkDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             }
         }
 
+        var revbuf: [64]u8 = undefined;
+        var result: ?@import("../store/db.zig").PutResult = null;
+        var fail: ?[]const u8 = null;
+        var fail_reason: ?[]const u8 = null;
+
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
         try jsonw.writeValue(&body_buf, res.arena, doc_val);
         var doc_body: []const u8 = body_buf.items;
@@ -4841,80 +5404,141 @@ fn hBulkDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                         }
                     }
                 }
-                doc_body = prepareAttachments(res, &doc_val, parent_leaf) catch |e| switch (e) {
-                    error.MissingStub => return err(res, 412, "missing_stub", "A pre-existing attachment stub wasn't found"),
-                    else => return e,
-                };
+                if (prepareAttachments(res, &doc_val, parent_leaf, app.max_body_bytes)) |prepared| {
+                    doc_body = prepared;
+                } else |e| switch (e) {
+                    error.MissingStub => {
+                        fail = "missing_stub";
+                        fail_reason = "A pre-existing attachment stub wasn't found";
+                    },
+                    error.TooLarge => {
+                        fail = "too_large";
+                        fail_reason = "Attachment exceeds ZOUCH_MAX_BODY_MB";
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        fail = "bad_request";
+                        fail_reason = @errorName(e);
+                    },
+                }
             }
-            doc_body = try externalizeBody(db, res.arena, doc_body);
+            if (fail == null) {
+                if (externalizeBody(db, res.arena, doc_body)) |ext_body| {
+                    doc_body = ext_body;
+                } else |e| switch (e) {
+                    error.OutOfMemory, error.Io => return e,
+                    else => {
+                        fail = "bad_request";
+                        fail_reason = @errorName(e);
+                    },
+                }
+            }
         }
 
-        var revbuf: [64]u8 = undefined;
-        var result: ?@import("../store/db.zig").PutResult = null;
-        var fail: ?[]const u8 = null;
-        var fail_reason: ?[]const u8 = null;
-
-        if (new_edits) {
-            var parent: ?Rev = null;
-            if (doc_val.object.get("_rev")) |rv| {
-                if (rv == .string) parent = Rev.parse(rv.string) catch null;
-            }
-            const deleted = if (doc_val.object.get("_deleted")) |dv| (dv == .bool and dv.bool) else false;
-            if (try validateDoc(db, res.arena, id, doc_body, oldDocBody(db, id))) |reason| {
-                fail = "forbidden";
-                fail_reason = reason;
-            } else {
-                result = db.putLocalBatch(id, doc_body, parent, deleted) catch |e| blk: {
-                    if (e == error.Conflict) {
-                        fail = "conflict";
-                        break :blk null;
-                    }
-                    return e;
-                };
-            }
-        } else {
-            const rv = doc_val.object.get("_rev");
-            if (rv == null) {
-                fail = "missing_rev";
-                fail_reason = "Missing _rev";
-            } else if (rv.? != .string) {
-                fail = "bad_rev";
-                fail_reason = "Invalid _rev";
-            } else if (Rev.parse(rv.?.string) catch null) |rev| {
-                var ancestry_buf: std.ArrayListUnmanaged(Rev) = .empty;
-                defer ancestry_buf.deinit(res.arena);
-                if (doc_val.object.get("_revisions")) |revs_val| {
-                    if (revs_val == .object) {
-                        const start_v = revs_val.object.get("start");
-                        const ids_v = revs_val.object.get("ids");
-                        if (start_v != null and ids_v != null and start_v.? == .integer and ids_v.? == .array) {
-                            const start: u32 = std.math.cast(u32, start_v.?.integer) orelse return err(res, 400, "bad_request", "invalid revision start");
-                            for (ids_v.?.array.items, 0..) |idv2, i| {
-                                if (idv2 != .string) continue;
-                                const g = start -| @as(u32, @intCast(i));
-                                const ar = revFromParts(g, idv2.string) catch continue;
-                                ancestry_buf.append(res.arena, ar) catch {};
-                            }
-                        }
-                    }
+        if (fail == null) {
+            if (new_edits) {
+                var parent: ?Rev = null;
+                if (doc_val.object.get("_rev")) |rv| {
+                    if (rv == .string) parent = Rev.parse(rv.string) catch null;
                 }
-                if (ancestry_buf.items.len == 0) try ancestry_buf.append(res.arena, rev);
-                const deleted = if (obj.get("_deleted")) |dv| (dv == .bool and dv.bool) else false;
-                if (try validateDoc(db, res.arena, id, doc_body, oldDocBody(db, id))) |reason| {
-                    fail = "forbidden";
-                    fail_reason = reason;
+                const deleted = if (doc_val.object.get("_deleted")) |dv| (dv == .bool and dv.bool) else false;
+                if (try validateDoc(db, res.arena, id, parent, doc_body, deleted)) |rej| {
+                    fail = rej.code;
+                    fail_reason = rej.reason;
                 } else {
-                    result = db.putImportedBatch(id, rev, ancestry_buf.items, doc_body, deleted) catch |e| blk: {
-                        if (e == error.Conflict) {
-                            fail = "conflict";
-                            break :blk null;
+                    result = db.putLocalBatch(id, doc_body, parent, deleted) catch |e| blk: {
+                        switch (e) {
+                            error.Conflict => fail = "conflict",
+                            error.InvalidRev => {
+                                fail = "bad_rev";
+                                fail_reason = "Invalid _rev";
+                            },
+                            error.TooLarge => {
+                                fail = "too_large";
+                                fail_reason = "Document exceeds limit";
+                            },
+                            error.MemoryLimitExceeded => {
+                                fail = "insufficient_storage";
+                                fail_reason = "Database memory limit exceeded";
+                            },
+                            error.FileTooLarge => {
+                                fail = "insufficient_storage";
+                                fail_reason = "Database file exceeds maximum supported size";
+                            },
+                            else => return e,
                         }
-                        return e;
+                        break :blk null;
                     };
                 }
             } else {
-                fail = "bad_rev";
-                fail_reason = "Invalid _rev";
+                const rv = doc_val.object.get("_rev");
+                if (rv == null) {
+                    fail = "missing_rev";
+                    fail_reason = "Missing _rev";
+                } else if (rv.? != .string) {
+                    fail = "bad_rev";
+                    fail_reason = "Invalid _rev";
+                } else if (Rev.parse(rv.?.string) catch null) |rev| {
+                    var ancestry_buf: std.ArrayListUnmanaged(Rev) = .empty;
+                    defer ancestry_buf.deinit(res.arena);
+                    var bad_start = false;
+                    if (doc_val.object.get("_revisions")) |revs_val| {
+                        if (revs_val == .object) {
+                            const start_v = revs_val.object.get("start");
+                            const ids_v = revs_val.object.get("ids");
+                            if (start_v != null and ids_v != null and start_v.? == .integer and ids_v.? == .array) {
+                                if (std.math.cast(u32, start_v.?.integer)) |start| {
+                                    for (ids_v.?.array.items, 0..) |idv2, i| {
+                                        if (idv2 != .string) continue;
+                                        const g = start -| @as(u32, @intCast(i));
+                                        const ar = revFromParts(g, idv2.string) catch continue;
+                                        try ancestry_buf.append(res.arena, ar);
+                                    }
+                                } else {
+                                    bad_start = true;
+                                }
+                            }
+                        }
+                    }
+                    if (bad_start) {
+                        fail = "bad_request";
+                        fail_reason = "invalid revision start";
+                    } else {
+                        if (ancestry_buf.items.len == 0) try ancestry_buf.append(res.arena, rev);
+                        const deleted = if (obj.get("_deleted")) |dv| (dv == .bool and dv.bool) else false;
+                        if (try validateDoc(db, res.arena, id, rev, doc_body, deleted)) |rej| {
+                            fail = rej.code;
+                            fail_reason = rej.reason;
+                        } else {
+                            result = db.putImportedBatch(id, rev, ancestry_buf.items, doc_body, deleted) catch |e| blk: {
+                                switch (e) {
+                                    error.Conflict => fail = "conflict",
+                                    error.InvalidRev => {
+                                        fail = "bad_rev";
+                                        fail_reason = "Invalid _rev";
+                                    },
+                                    error.TooLarge => {
+                                        fail = "too_large";
+                                        fail_reason = "Document exceeds limit";
+                                    },
+                                    error.MemoryLimitExceeded => {
+                                        fail = "insufficient_storage";
+                                        fail_reason = "Database memory limit exceeded";
+                                    },
+                                    error.FileTooLarge => {
+                                        fail = "insufficient_storage";
+                                        fail_reason = "Database file exceeds maximum supported size";
+                                    },
+                                    else => return e,
+                                }
+                                break :blk null;
+                            };
+                        }
+                    }
+                } else {
+                    fail = "bad_rev";
+                    fail_reason = "Invalid _rev";
+                }
             }
         }
 
@@ -4944,6 +5568,7 @@ fn hBulkDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         db.failed = true;
         return e;
     };
+    if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
     try out.append(res.arena, ']');
     res.status = 201;
     res.content_type = .JSON;
@@ -4974,7 +5599,18 @@ fn leafHasAttachmentPayload(db: *Db, alloc: std.mem.Allocator, leaf: Leaf) bool 
     const atts = parsed.value.object.get("_attachments") orelse return false;
     if (atts != .object) return false;
     for (atts.object.values()) |one| {
-        if ((attachmentRaw(db, alloc, one) catch null) != null) return true;
+        if (one != .object) continue;
+        if (one.object.get("data")) |dv| {
+            if (dv == .string) return true;
+        }
+        if (one.object.get("blob")) |bv| {
+            if (bv == .string) {
+                if (db.openBlob(bv.string)) |f| {
+                    f.close(db.io);
+                    return true;
+                } else |_| {}
+            }
+        }
     }
     return false;
 }
@@ -5000,6 +5636,12 @@ fn appendMultipartAttachments(
         try list.appendSlice(alloc, boundary);
         try list.appendSlice(alloc, "\r\nContent-Type: ");
         try list.appendSlice(alloc, ct);
+        if (one.object.get("encoding")) |ev| {
+            if (ev == .string and headerSafe(ev.string)) {
+                try list.appendSlice(alloc, "\r\nContent-Encoding: ");
+                try list.appendSlice(alloc, ev.string);
+            }
+        }
         try list.appendSlice(alloc, "\r\nContent-Disposition: attachment; filename=\"");
         try appendQuotedFilename(list, alloc, name);
         try list.appendSlice(alloc, "\"\r\n\r\n");
@@ -5106,7 +5748,7 @@ fn bulkGetMultipart(
 
 fn hBulkGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const docs_val = root.object.get("docs") orelse return err(res, 400, "bad_request", "missing docs");
@@ -5188,7 +5830,7 @@ fn hBulkGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 try l.appendSlice(res.arena, ",\"error\":\"not_found\",\"reason\":\"missing\"}}");
             } else if (retained_hit) |ret| {
                 try l.appendSlice(res.arena, "{\"ok\":");
-                try writeRetainedDoc(res, &l, doc.?, ret, with_revs);
+                try writeRetainedDoc(db, res.arena, &l, doc.?, ret.rev, ret.body, ret.deleted, with_revs, with_atts);
                 try l.append(res.arena, '}');
             } else {
                 try l.appendSlice(res.arena, "{\"ok\":");
@@ -5203,53 +5845,58 @@ fn hBulkGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = l.items;
 }
 
-/// A document as it stood at a revision that is no longer a leaf: the stored
-/// body, with `_id`, `_rev` and - when asked - the chain `_revisions` describes.
+/// A document as it stood at a revision that is no longer a leaf: cleaned user
+/// fields, `_id`, `_rev`, optional `_deleted`/`_revisions`, and normalized
+/// `_attachments` (never leaking internal `blob`/`data:null`).
 fn writeRetainedDoc(
-    res: *httpz.Response,
-    l: *std.ArrayListUnmanaged(u8),
+    db: *Db,
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(u8),
     doc: *const tree.Doc,
-    ret: *const tree.Retained,
+    rev: Rev,
+    body_raw: []const u8,
+    deleted: bool,
     with_revs: bool,
+    inline_atts: bool,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, res.arena, ret.body, .{}) catch {
-        try l.appendSlice(res.arena, "{\"_id\":");
-        try jsonw.writeString(l, res.arena, doc.id);
-        try l.appendSlice(res.arena, "}");
-        return;
-    };
-    if (parsed.value != .object) {
-        try l.appendSlice(res.arena, "{\"_id\":");
-        try jsonw.writeString(l, res.arena, doc.id);
-        try l.appendSlice(res.arena, "}");
-        return;
+    var revbuf: [64]u8 = undefined;
+    try list.append(alloc, '{');
+    try jsonw.fieldString(list, alloc, "_id", doc.id);
+    try list.append(alloc, ',');
+    try jsonw.fieldString(list, alloc, "_rev", rev.write(&revbuf));
+    if (deleted) {
+        try list.appendSlice(alloc, ",\"_deleted\":true");
     }
-    var rbuf: [64]u8 = undefined;
-    try parsed.value.object.put(res.arena, "_id", .{ .string = doc.id });
-    try parsed.value.object.put(res.arena, "_rev", .{ .string = try res.arena.dupe(u8, ret.rev.write(&rbuf)) });
-    if (!with_revs) {
-        try jsonw.writeValue(l, res.arena, parsed.value);
-        return;
+    if (with_revs) {
+        try list.appendSlice(alloc, ",\"_revisions\":{\"start\":");
+        try appendInt(list, alloc, rev.gen);
+        try list.appendSlice(alloc, ",\"ids\":[");
+        var first = true;
+        const fallback_anc = [_]Rev{rev};
+        const anc_slice = doc.ancestryFor(rev) orelse &fallback_anc;
+        for (anc_slice) |anc| {
+            if (!first) try list.append(alloc, ',');
+            first = false;
+            try jsonw.writeString(list, alloc, anc.hash[0..]);
+        }
+        try list.appendSlice(alloc, "]}");
     }
-    // `_revisions` is written into the object's own text, before its brace.
-    var body: std.ArrayListUnmanaged(u8) = .empty;
-    try jsonw.writeValue(&body, res.arena, parsed.value);
-    body.items.len -= 1;
-    try body.appendSlice(res.arena, ",\"_revisions\":{\"start\":");
-    try appendInt(&body, res.arena, ret.rev.gen);
-    try body.appendSlice(res.arena, ",\"ids\":[");
-    var first = true;
-    for (ret.ancestry) |anc| {
-        if (!first) try body.append(res.arena, ',');
-        first = false;
-        // `ids[]` holds the hash alone; `write` produces `gen-hash`.
-        var ab: [64]u8 = undefined;
-        const text = anc.write(&ab);
-        const dash = std.mem.indexOfScalar(u8, text, '-') orelse 0;
-        try jsonw.writeString(&body, res.arena, text[dash + 1 ..]);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body_raw, .{}) catch null;
+    defer if (parsed) |*p| p.deinit();
+    if (parsed) |p| {
+        if (p.value == .object) {
+            for (p.value.object.keys(), p.value.object.values()) |k, v| {
+                if (metaKey(k)) continue;
+                try list.append(alloc, ',');
+                try jsonw.writeString(list, alloc, k);
+                try list.append(alloc, ':');
+                try jsonw.writeValue(list, alloc, v);
+            }
+            const att_mode: AttachmentOutput = if (inline_atts) .inline_data else .stub;
+            try writeAttachments(db, list, alloc, p.value.object.get("_attachments") orelse .null, rev.gen, att_mode);
+        }
     }
-    try body.appendSlice(res.arena, "]}}");
-    try l.appendSlice(res.arena, body.items);
+    try list.append(alloc, '}');
 }
 
 fn hChanges(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -5276,8 +5923,8 @@ fn hChanges(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             // CouchDB sends the selection in the body of a POST; without one
             // there is nothing to select, and answering with every document
             // would silently copy the whole database.
-            const body = fullBody(req, res.arena) catch
-                return err(res, 400, "bad_request", "filter=_doc_ids needs a JSON body with doc_ids");
+            const body = fullBody(req, res.arena, app.max_body_bytes) catch |e|
+                if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "filter=_doc_ids needs a JSON body with doc_ids");
             if (body.len == 0) return err(res, 400, "bad_request", "filter=_doc_ids needs a JSON body with doc_ids");
             var parsed = std.json.parseFromSlice(std.json.Value, res.arena, body, .{}) catch
                 return err(res, 400, "bad_request", "filter=_doc_ids body is not JSON");
@@ -5295,8 +5942,8 @@ fn hChanges(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         } else if (std.mem.eql(u8, spec, "_selector")) {
             // CouchDB sends the selector in the body of a POST. Match it here
             // with the same matcher `_find` uses.
-            const body = fullBody(req, res.arena) catch
-                return err(res, 400, "bad_request", "filter=_selector needs a JSON body with a selector");
+            const body = fullBody(req, res.arena, app.max_body_bytes) catch |e|
+                if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "filter=_selector needs a JSON body with a selector");
             if (body.len == 0) return err(res, 400, "bad_request", "filter=_selector needs a JSON body with a selector");
             var parsed_body = std.json.parseFromSlice(std.json.Value, res.arena, body, .{}) catch
                 return err(res, 400, "bad_request", "filter=_selector body is not JSON");
@@ -5317,7 +5964,7 @@ fn hChanges(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 if (matchSelector(doc_parsed.value, sel)) try selected.put(res.arena, d.*.id, {});
             }
             filter_ids = selected;
-        } else filter_ids = buildFilterIds(db, res.arena, spec, since) catch |e| switch (e) {
+        } else filter_ids = buildFilterIds(db, res.arena, spec, since, try buildQueryJson(res.arena, req)) catch |e| switch (e) {
             error.FilterNotFound => return err(res, 404, "not_found", "missing filter"),
             error.FilterError => return err(res, 500, "filter_error", "filter function failed"),
             else => return e,
@@ -5327,7 +5974,7 @@ fn hChanges(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     return writeChanges(db, res, since, limit, include_docs, style_all, filter_ids, eventsource);
 }
 
-fn buildFilterIds(db: *Db, alloc: std.mem.Allocator, spec: []const u8, since: u64) !std.StringHashMapUnmanaged(void) {
+fn findFilterSource(db: *Db, alloc: std.mem.Allocator, spec: []const u8) ![]u8 {
     const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return error.FilterNotFound;
     const ddoc = spec[0..slash];
     const fname = spec[slash + 1 ..];
@@ -5336,44 +5983,55 @@ fn buildFilterIds(db: *Db, alloc: std.mem.Allocator, spec: []const u8, since: u6
     defer alloc.free(ddoc_id);
     const design = db.get(ddoc_id) orelse return error.FilterNotFound;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, design.winnerLeaf().body, .{}) catch return error.FilterNotFound;
-    // `fv`, `fn_src` and `code` all copy what they need out of the parsed
-    // document, so it can be released with the rest of the scratch. Feed
-    // schedulers call this with a general allocator every tick.
+    // `fv` is duplicated before `parsed` is freed so the scheduler can hold
+    // only what it needs.
     defer parsed.deinit();
     if (parsed.value != .object) return error.FilterNotFound;
     const filters = parsed.value.object.get("filters") orelse return error.FilterNotFound;
     if (filters != .object) return error.FilterNotFound;
     const fv = filters.object.get(fname) orelse return error.FilterNotFound;
     if (fv != .string) return error.FilterNotFound;
+    return try alloc.dupe(u8, fv.string);
+}
+
+fn validateFilterExists(db: *Db, alloc: std.mem.Allocator, spec: []const u8) !void {
+    const src = try findFilterSource(db, alloc, spec);
+    alloc.free(src);
+}
+
+fn buildFilterIds(db: *Db, alloc: std.mem.Allocator, spec: []const u8, since: u64, req_query_json: ?[]const u8) !std.StringHashMapUnmanaged(void) {
+    const raw_src = try findFilterSource(db, alloc, spec);
+    defer alloc.free(raw_src);
 
     var code: std.ArrayListUnmanaged(u8) = .empty;
     defer code.deinit(alloc);
-    const fn_src = if (std.mem.startsWith(u8, std.mem.trim(u8, fv.string, " \t\r\n"), "function") or std.mem.indexOf(u8, fv.string, "=>") != null)
-        try std.fmt.allocPrint(alloc, "({s})", .{fv.string})
+    const trimmed = std.mem.trim(u8, raw_src, " \t\r\n");
+    const fn_src = if (std.mem.startsWith(u8, trimmed, "function") or std.mem.indexOf(u8, raw_src, "=>") != null)
+        try std.fmt.allocPrint(alloc, "({s})", .{raw_src})
     else
-        try std.fmt.allocPrint(alloc, "(function(doc,req){{ {s} }})", .{fv.string});
+        try std.fmt.allocPrint(alloc, "(function(doc,req){{ {s} }})", .{raw_src});
     defer alloc.free(fn_src);
     try code.appendSlice(alloc, "JSON.stringify((function(){const f=");
     try code.appendSlice(alloc, fn_src);
-    try code.appendSlice(alloc, ";const out=[];const docs=[");
+    try code.appendSlice(alloc, ";const req={query:");
+    try code.appendSlice(alloc, req_query_json orelse "{}");
+    try code.appendSlice(alloc, "};const out=[];const docs=[");
     var first = true;
     var it = db.docs.valueIterator();
     while (it.next()) |d| {
         if (d.*.seq <= since) continue;
         if (!first) try code.append(alloc, ',');
         first = false;
-        try code.appendSlice(alloc, "{\"id\":");
-        try jsonw.writeString(&code, alloc, d.*.id);
-        try code.appendSlice(alloc, ",\"body\":");
-        try code.appendSlice(alloc, d.*.winnerLeaf().body);
-        try code.append(alloc, '}');
+        const js_doc = try buildJsDoc(db, alloc, d.*.id, d.*.winnerLeaf().rev, d.*.winnerLeaf().body, d.*.winnerLeaf().deleted);
+        defer alloc.free(js_doc);
+        try code.appendSlice(alloc, js_doc);
     }
-    try code.appendSlice(alloc, "];for(const x of docs){const d=x.body;d._id=x.id;if(f(d,{}))out.push(x.id);}return out;})())");
+    try code.appendSlice(alloc, "];for(const d of docs){if(f(d,req))out.push(d._id);}return out;})())");
 
     var eng = qjs.Engine.init() catch return error.FilterError;
     defer eng.deinit();
-    const out = eng.eval(code.items) catch return error.FilterError;
-    defer std.heap.page_allocator.free(out);
+    const out = eng.eval(alloc, code.items) catch return error.FilterError;
+    defer alloc.free(out);
     const result = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch return error.FilterError;
     defer result.deinit();
     if (result.value != .array) return error.FilterError;
@@ -5405,7 +6063,10 @@ const ContinuousCtx = struct {
     style_all: bool,
     timeout_ms: usize,
     filter_spec: ?[]u8,
+    filter_query_json: ?[]u8 = null,
     elapsed: usize = 0,
+    in_flight: bool = false,
+    closing: bool = false,
 };
 
 fn hChangesContinuous(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -5417,17 +6078,13 @@ fn hChangesContinuous(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
     var timeout_ms: usize = if (q(req, "timeout")) |v| (std.fmt.parseInt(usize, v, 10) catch 60000) else 60000;
     if (timeout_ms == 0 or timeout_ms > 60000) timeout_ms = 60000;
 
-    app.mutex.lockUncancelable(app.io);
-    const db = (try app.getDb(name)) orelse {
-        app.mutex.unlock(app.io);
-        return err(res, 404, "not_found", "Database does not exist.");
-    };
+    const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+    var db_held = true;
+    defer if (db_held) app.releaseDb(db);
     if (filter_spec) |spec| {
-        _ = buildFilterIds(db, res.arena, spec, 0) catch |e| {
-            app.mutex.unlock(app.io);
+        validateFilterExists(db, res.arena, spec) catch |e| {
             return switch (e) {
                 error.FilterNotFound => err(res, 404, "not_found", "missing filter"),
-                error.FilterError => err(res, 500, "filter_error", "filter function failed"),
                 else => e,
             };
         };
@@ -5436,7 +6093,8 @@ fn hChangesContinuous(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
         (if (std.mem.eql(u8, v, "now")) db.seq else (std.fmt.parseInt(u64, v, 10) catch 0))
     else
         0;
-    app.mutex.unlock(app.io);
+    app.releaseDb(db);
+    db_held = false;
 
     const active = app.feed_threads.fetchAdd(1, .monotonic);
     if (active >= app.max_feeds) {
@@ -5451,9 +6109,12 @@ fn hChangesContinuous(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
     const alloc = std.heap.page_allocator;
     const filter_copy: ?[]u8 = if (filter_spec) |f| try alloc.dupe(u8, f) else null;
     errdefer if (filter_copy) |f| alloc.free(f);
+    const query_copy: ?[]u8 = if (filter_spec != null) try buildQueryJson(alloc, req) else null;
+    errdefer if (query_copy) |fq| alloc.free(fq);
     const ctx = try alloc.create(ContinuousCtx);
     errdefer alloc.destroy(ctx);
     const stream = try startJsonChunked(res);
+    setSocketTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, 1);
     ctx.* = .{
         .app = app,
         .db = db,
@@ -5465,6 +6126,7 @@ fn hChangesContinuous(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
         .style_all = style_all,
         .timeout_ms = timeout_ms,
         .filter_spec = filter_copy,
+        .filter_query_json = query_copy,
     };
     app.feed_mutex.lockUncancelable(app.io);
     // The database may have been deleted while this request was preparing its
@@ -5503,7 +6165,10 @@ const LongpollCtx = struct {
     style_all: bool,
     timeout_ms: usize,
     filter_spec: ?[]u8,
+    filter_query_json: ?[]u8 = null,
     elapsed: usize = 0,
+    in_flight: bool = false,
+    closing: bool = false,
 };
 
 fn startJsonChunked(res: *httpz.Response) !std.Io.net.Stream {
@@ -5572,7 +6237,6 @@ fn retryTicks(failures: u32) u64 {
 /// `selector`. `db` is only needed for a selector against a local source, since
 /// that has to be matched here; a remote source evaluates it in its own feed.
 fn buildSelection(
-    app: *App,
     arena: std.mem.Allocator,
     db: ?*Db,
     doc_ids_v: ?std.json.Value,
@@ -5590,8 +6254,8 @@ fn buildSelection(
         if (sel != .object) return error.InvalidSelection;
         if (findUnknownOperator(sel) != null) return error.InvalidSelection;
         const source_db = db orelse return error.InvalidSelection;
-        app.mutex.lockUncancelable(app.io);
-        defer app.mutex.unlock(app.io);
+        source_db.lock();
+        defer source_db.unlock();
         var it = source_db.docs.valueIterator();
         while (it.next()) |d| {
             var parsed_doc = std.json.parseFromSlice(std.json.Value, arena, d.*.winnerLeaf().body, .{}) catch continue;
@@ -5658,15 +6322,11 @@ fn runReplicationJob(
                     else => return e,
                 };
             };
-            defer {
-                app.mutex.lockUncancelable(app.io);
-                _ = app.deleteDb(stage_name) catch {};
-                app.mutex.unlock(app.io);
-            }
+            defer _ = app.deleteDb(stage_name) catch {};
 
             var remote_selection = replicator.IdFilter{};
             if (has_selection) {
-                remote_selection = buildSelection(app, arena, null, doc_ids_v, selector_v) catch |e| {
+                remote_selection = buildSelection(arena, null, doc_ids_v, selector_v) catch |e| {
                     if (diag) |d| d.set("invalid selection: {s}", .{@errorName(e)});
                     return error.InvalidReplicationDoc;
                 };
@@ -5716,6 +6376,7 @@ fn runReplicationJob(
                 // resume (in source-seq terms) for the whole job.
                 .use_checkpoints = false,
                 .target_path = "",
+                .max_attachment_bytes = app.max_body_bytes,
                 .username = source_ep.user,
                 .password = source_ep.password,
                 .filter = remote_filter,
@@ -5724,7 +6385,7 @@ fn runReplicationJob(
                 .diag = diag,
                 .lock = ReplLock.lockFn,
                 .unlock = ReplLock.unlockFn,
-                .lock_ctx = app,
+                .lock_ctx = stage,
             });
             defer if (remote_pull.end_seq) |e| app.alloc.free(e);
             defer if (remote_pull.start_seq) |e| app.alloc.free(e);
@@ -5733,7 +6394,7 @@ fn runReplicationJob(
                 .username = target_ep.user,
                 .password = target_ep.password,
                 .diag = diag,
-                .guard = replGuard(app),
+                .guard = replGuard(stage),
                 .doc_ids = if (has_selection) &remote_selection else null,
                 .use_checkpoints = false,
                 .worker_batch_size = page_size,
@@ -5765,10 +6426,10 @@ fn runReplicationJob(
             error.DatabaseInUse => return error.DatabaseInUse,
             else => return error.SourceDatabaseNotFound,
         };
-        defer app.unpinDb(source_db);
+        defer app.unpinReplication(source_db);
         var selection = replicator.IdFilter{};
         if (has_selection) {
-            selection = buildSelection(app, arena, source_db, doc_ids_v, selector_v) catch |e| {
+            selection = buildSelection(arena, source_db, doc_ids_v, selector_v) catch |e| {
                 if (diag) |d| d.set("invalid selection: {s}", .{@errorName(e)});
                 return error.InvalidReplicationDoc;
             };
@@ -5778,7 +6439,7 @@ fn runReplicationJob(
             .username = target_ep.user,
             .password = target_ep.password,
             .diag = diag,
-            .guard = replGuard(app),
+            .guard = replGuard(source_db),
             .doc_ids = if (has_selection) &selection else null,
             .use_checkpoints = use_checkpoints,
             .worker_batch_size = page_size,
@@ -5809,7 +6470,7 @@ fn runReplicationJob(
             error.DatabaseInUse => return error.DatabaseInUse,
             else => return error.TargetDatabaseNotFound,
         };
-        defer app.unpinDb(target);
+        defer app.unpinReplication(target);
         // Two database names mean a local copy, which CouchDB's `_replicator`
         // accepts too; there is no URL to parse in that case.
         if (!source_ep.is_url) {
@@ -5818,10 +6479,10 @@ fn runReplicationJob(
                 error.DatabaseInUse => return error.DatabaseInUse,
                 else => return error.SourceDatabaseNotFound,
             };
-            defer app.unpinDb(src);
+            defer app.unpinReplication(src);
             var selection = replicator.IdFilter{};
             if (has_selection) {
-                selection = buildSelection(app, arena, src, doc_ids_v, selector_v) catch |e| {
+                selection = buildSelection(arena, src, doc_ids_v, selector_v) catch |e| {
                     if (diag) |d| d.set("invalid selection: {s}", .{@errorName(e)});
                     return error.InvalidReplicationDoc;
                 };
@@ -5834,14 +6495,17 @@ fn runReplicationJob(
                 .diag = diag,
                 .lock = ReplLock.lockFn,
                 .unlock = ReplLock.unlockFn,
-                .lock_ctx = app,
+                .lock_ctx = target,
+                .source_guard = replGuard(src),
             });
+            if (std.mem.eql(u8, target_ep.raw_url, "_users")) app.invalidateUsersCache();
             stats.* = .{
                 .revisions_checked = pulled.changes_seen,
                 .bulk_get_attempts = pulled.bulk_get_attempts,
                 .bulk_get_docs = pulled.bulk_get_docs,
                 .docs_read = pulled.documents,
                 .docs_written = pulled.documents,
+                .doc_write_failures = pulled.doc_write_failures,
                 .checkpointed_source_seq = if (pulled.end_seq) |e| try stats_alloc.dupe(u8, e) else null,
             };
             return;
@@ -5852,7 +6516,7 @@ fn runReplicationJob(
         } else null;
         var selection = replicator.IdFilter{};
         if (doc_ids_v != null) {
-            selection = buildSelection(app, arena, null, doc_ids_v, null) catch return error.InvalidReplicationDoc;
+            selection = buildSelection(arena, null, doc_ids_v, null) catch return error.InvalidReplicationDoc;
         }
         var selector_text: ?[]const u8 = null;
         if (selector_v) |sel| {
@@ -5864,6 +6528,8 @@ fn runReplicationJob(
         const pulled = try replicator.pullInto(app.alloc, app.io, target, .{
             .source = source_ep.clean_url,
             .target_path = "",
+            .checkpoint_target = try std.fmt.allocPrint(arena, "{s}:{s}", .{ target_ep.raw_url, &target.uuid }),
+            .max_attachment_bytes = app.max_body_bytes,
             .username = source_ep.user,
             .password = source_ep.password,
             .filter = filter,
@@ -5875,14 +6541,16 @@ fn runReplicationJob(
             .diag = diag,
             .lock = ReplLock.lockFn,
             .unlock = ReplLock.unlockFn,
-            .lock_ctx = app,
+            .lock_ctx = target,
         });
+        if (std.mem.eql(u8, target_ep.raw_url, "_users")) app.invalidateUsersCache();
         stats.* = .{
             .revisions_checked = pulled.changes_seen,
             .bulk_get_attempts = pulled.bulk_get_attempts,
             .bulk_get_docs = pulled.bulk_get_docs,
             .docs_read = pulled.documents,
             .docs_written = pulled.documents,
+            .doc_write_failures = pulled.doc_write_failures,
             .checkpointed_source_seq = if (pulled.end_seq) |e| try stats_alloc.dupe(u8, e) else null,
         };
     }
@@ -5933,6 +6601,7 @@ fn compactionScheduler(app: *App) void {
 
 const ReplJob = struct {
     id: []u8,
+    rev: Rev,
     body: []u8,
     is_continuous: bool,
     state_is_error: bool,
@@ -6001,6 +6670,67 @@ fn replicationId(alloc: std.mem.Allocator, source: []const u8, target: []const u
     return std.fmt.allocPrint(alloc, "{s}+continuous", .{hex});
 }
 
+const max_concurrent_repl_jobs: usize = 4;
+
+fn freeRunningJob(alloc: std.mem.Allocator, r: RunningJob) void {
+    if (r.id) |id| alloc.free(@constCast(id));
+    if (r.repl_id) |id| alloc.free(@constCast(id));
+    if (r.source) |src| alloc.free(@constCast(src));
+    if (r.target) |tgt| alloc.free(@constCast(tgt));
+}
+
+fn isJobRunningLocked(app: *const App, id: []const u8) bool {
+    for (app.repl_running.items) |r| {
+        if (r.id) |rid| {
+            if (std.mem.eql(u8, rid, id)) return true;
+        }
+    }
+    return false;
+}
+
+fn registerRunningJobLocked(app: *App, job: ReplJob) bool {
+    var arena = std.heap.ArenaAllocator.init(app.alloc);
+    defer arena.deinit();
+    var started_root = std.json.parseFromSlice(std.json.Value, arena.allocator(), job.body, .{}) catch null;
+    const started_source = if (started_root) |*sr| (if (sr.value == .object) sr.value.object.get("source") else null) else null;
+    const started_target = if (started_root) |*sr| (if (sr.value == .object) sr.value.object.get("target") else null) else null;
+    const id_copy = app.alloc.dupe(u8, job.id) catch return false;
+    errdefer app.alloc.free(id_copy);
+    const repl_id = blk: {
+        const sv = started_source orelse break :blk null;
+        const tv = started_target orelse break :blk null;
+        if (sv != .string or tv != .string) break :blk null;
+        break :blk replicationId(app.alloc, sv.string, tv.string) catch null;
+    };
+    errdefer if (repl_id) |rid| app.alloc.free(@constCast(rid));
+    const src_red = if (started_source) |sv| redactEndpoint(app.alloc, sv) catch null else null;
+    errdefer if (src_red) |sr| app.alloc.free(@constCast(sr));
+    const tgt_red = if (started_target) |tv| redactEndpoint(app.alloc, tv) catch null else null;
+    errdefer if (tgt_red) |tr| app.alloc.free(@constCast(tr));
+    app.repl_running.append(app.alloc, .{
+        .id = id_copy,
+        .repl_id = repl_id,
+        .source = src_red,
+        .target = tgt_red,
+        .started = @intCast(@divTrunc(Io.Timestamp.now(app.io, .real).nanoseconds, std.time.ns_per_s)),
+    }) catch return false;
+    return true;
+}
+
+fn removeRunningJob(app: *App, id: []const u8) void {
+    app.mutex.lockUncancelable(app.io);
+    defer app.mutex.unlock(app.io);
+    for (app.repl_running.items, 0..) |r, idx| {
+        if (r.id) |rid| {
+            if (std.mem.eql(u8, rid, id)) {
+                freeRunningJob(app.alloc, r);
+                _ = app.repl_running.orderedRemove(idx);
+                return;
+            }
+        }
+    }
+}
+
 fn replicatorScheduler(app: *App) void {
     var tick: u64 = 0;
     var jobs: std.ArrayListUnmanaged(ReplJob) = .empty;
@@ -6008,29 +6738,55 @@ fn replicatorScheduler(app: *App) void {
     while (true) {
         sleepMs(app.io, 2000);
         tick +%= 1;
-
-        for (jobs.items) |job| {
-            app.alloc.free(job.id);
-            app.alloc.free(job.body);
-        }
         jobs.clearRetainingCapacity();
 
-        app.mutex.lockUncancelable(app.io);
-        collectDueJobs(app, &jobs, tick);
-        app.mutex.unlock(app.io);
+        if (app.acquireDb("_replicator") catch null) |rdb| {
+            defer app.releaseDb(rdb);
+            // db.mutex, then app.mutex: the same order `acquireDb` callers use
+            // when they look up another database while holding their own.
+            app.mutex.lockUncancelable(app.io);
+            defer app.mutex.unlock(app.io);
+            const slots = max_concurrent_repl_jobs -| app.repl_running.items.len;
+            if (slots > 0) collectDueJobs(app, rdb, &jobs, tick, slots);
+            // Register all picked jobs before releasing app.mutex so the next
+            // tick cannot start a second worker for the same document.
+            var w: usize = 0;
+            for (jobs.items) |job| {
+                if (registerRunningJobLocked(app, job)) {
+                    jobs.items[w] = job;
+                    w += 1;
+                } else {
+                    app.alloc.free(job.id);
+                    app.alloc.free(job.body);
+                }
+            }
+            jobs.shrinkRetainingCapacity(w);
+        }
 
-        for (jobs.items) |job| runJob(app, job, tick);
+        for (jobs.items) |job| {
+            const t = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, runJobThread, .{ app, job, tick }) catch {
+                removeRunningJob(app, job.id);
+                app.alloc.free(job.id);
+                app.alloc.free(job.body);
+                continue;
+            };
+            t.detach();
+        }
     }
 }
 
-fn collectDueJobs(app: *App, jobs: *std.ArrayListUnmanaged(ReplJob), tick: u64) void {
-    const rdb = (app.getDb("_replicator") catch null) orelse return;
+fn collectDueJobs(app: *App, rdb: *Db, jobs: *std.ArrayListUnmanaged(ReplJob), tick: u64, max_jobs: usize) void {
     var it = rdb.docs.valueIterator();
     while (it.next()) |entry| {
+        if (jobs.items.len >= max_jobs) break;
         const doc = entry.*;
-        if (doc.winnerLeaf().deleted) continue;
-        if (app.repl_done.contains(doc.id)) continue;
-        const body = doc.winnerLeaf().body;
+        const leaf = doc.winnerLeaf();
+        if (leaf.deleted) continue;
+        if (app.repl_done.get(doc.id)) |done_rev| {
+            if (done_rev.eql(leaf.rev)) continue;
+        }
+        if (isJobRunningLocked(app, doc.id)) continue;
+        const body = leaf.body;
         var parsed = std.json.parseFromSlice(std.json.Value, app.alloc, body, .{}) catch continue;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
@@ -6068,6 +6824,7 @@ fn collectDueJobs(app: *App, jobs: *std.ArrayListUnmanaged(ReplJob), tick: u64) 
         };
         jobs.append(app.alloc, .{
             .id = id_copy,
+            .rev = leaf.rev,
             .body = body_copy,
             .is_continuous = is_continuous,
             .state_is_error = state_is_error,
@@ -6076,6 +6833,15 @@ fn collectDueJobs(app: *App, jobs: *std.ArrayListUnmanaged(ReplJob), tick: u64) 
             app.alloc.free(body_copy);
         };
     }
+}
+
+fn runJobThread(app: *App, job: ReplJob, tick: u64) void {
+    defer {
+        removeRunningJob(app, job.id);
+        app.alloc.free(job.id);
+        app.alloc.free(job.body);
+    }
+    runJob(app, job, tick);
 }
 
 fn runJob(app: *App, job: ReplJob, tick: u64) void {
@@ -6087,66 +6853,39 @@ fn runJob(app: *App, job: ReplJob, tick: u64) void {
     const task_tgt = if (started_root) |sr| (if (sr.value == .object) (if (sr.value.object.get("target")) |v| (if (v == .string) v.string else null) else null) else null) else null;
     const repl_task_pid = app.beginTask("replication", "_replicator", null, task_src, task_tgt, job.id, 0);
     defer app.endTask(repl_task_pid);
-    const started_source = if (started_root) |r| r.value.object.get("source") else null;
-    const started_target = if (started_root) |r| r.value.object.get("target") else null;
-    app.mutex.lockUncancelable(app.io);
-    app.repl_running = .{
-        .id = app.alloc.dupe(u8, job.id) catch null,
-        .repl_id = blk: {
-            const sv = started_source orelse break :blk null;
-            const tv = started_target orelse break :blk null;
-            if (sv != .string or tv != .string) break :blk null;
-            break :blk replicationId(app.alloc, sv.string, tv.string) catch null;
-        },
-        .source = blk: {
-            const sv = started_source orelse break :blk null;
-            break :blk redactEndpoint(app.alloc, sv) catch null;
-        },
-        .target = blk: {
-            const tv = started_target orelse break :blk null;
-            break :blk redactEndpoint(app.alloc, tv) catch null;
-        },
-        .started = @intCast(@divTrunc(Io.Timestamp.now(app.io, .real).nanoseconds, std.time.ns_per_s)),
-    };
-    app.mutex.unlock(app.io);
-    defer {
-        app.mutex.lockUncancelable(app.io);
-        if (app.repl_running) |r| {
-            if (r.id) |id| app.alloc.free(@constCast(id));
-            if (r.repl_id) |id| app.alloc.free(@constCast(id));
-            if (r.source) |s| app.alloc.free(@constCast(s));
-            if (r.target) |t| app.alloc.free(@constCast(t));
-            app.repl_running = null;
-        }
-        app.mutex.unlock(app.io);
-    }
     var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), job.body, .{}) catch return;
     if (parsed.value != .object) return;
     var diag: replicator.Diag = .{ .alloc = arena.allocator() };
 
     var stats: ReplStats = .{};
     if (runReplicationJob(app, &parsed.value, &diag, &stats, arena.allocator())) |_| {
+        if (!job.is_continuous) {
+            recordReplicationStats(arena.allocator(), &parsed.value, stats);
+            markJobState(app, arena.allocator(), job, &parsed.value, "completed", null, 0);
+        } else if (job.state_is_error) {
+            markJobState(app, arena.allocator(), job, &parsed.value, "triggered", null, 0);
+        }
         app.mutex.lockUncancelable(app.io);
         defer app.mutex.unlock(app.io);
         if (app.repl_retry.fetchRemove(job.id)) |old| app.alloc.free(old.key);
         if (!job.is_continuous) {
-            recordReplicationStats(arena.allocator(), &parsed.value, stats);
-            markJobState(app, arena.allocator(), job, &parsed.value, "completed", null, 0);
             const key = app.alloc.dupe(u8, job.id) catch return;
-            app.repl_done.put(app.alloc, key, {}) catch app.alloc.free(key);
-        } else if (job.state_is_error) {
-            markJobState(app, arena.allocator(), job, &parsed.value, "triggered", null, 0);
+            if (app.repl_done.fetchRemove(job.id)) |old| app.alloc.free(old.key);
+            app.repl_done.put(app.alloc, key, job.rev) catch app.alloc.free(key);
         }
     } else |e| {
-        app.mutex.lockUncancelable(app.io);
-        defer app.mutex.unlock(app.io);
-        const failures: u32 = if (app.repl_retry.get(job.id)) |retry| retry.failures + 1 else 1;
-        if (app.repl_retry.fetchRemove(job.id)) |old| app.alloc.free(old.key);
-        const key = app.alloc.dupe(u8, job.id) catch return;
-        app.repl_retry.put(app.alloc, key, .{
-            .failures = failures,
-            .next_tick = tick + retryTicks(failures),
-        }) catch app.alloc.free(key);
+        const failures: u32 = blk: {
+            app.mutex.lockUncancelable(app.io);
+            defer app.mutex.unlock(app.io);
+            const f: u32 = if (app.repl_retry.get(job.id)) |retry| retry.failures + 1 else 1;
+            if (app.repl_retry.fetchRemove(job.id)) |old| app.alloc.free(old.key);
+            const key = app.alloc.dupe(u8, job.id) catch break :blk f;
+            app.repl_retry.put(app.alloc, key, .{
+                .failures = f,
+                .next_tick = tick + retryTicks(f),
+            }) catch app.alloc.free(key);
+            break :blk f;
+        };
         markJobState(app, arena.allocator(), job, &parsed.value, "error", diag.message orelse @errorName(e), failures);
     }
 }
@@ -6174,11 +6913,14 @@ fn recordReplicationStats(alloc: std.mem.Allocator, root: *std.json.Value, stats
     root.object.put(alloc, "_replication_stats", .{ .object = obj }) catch return;
 }
 
-/// Persist a job's state. The caller holds the app mutex: this reads and
-/// rewrites the `_replicator` document.
+/// Persist a job's state. Takes `_replicator`'s lock itself: it reads and
+/// rewrites the `_replicator` document. The caller must not hold `app.mutex`.
 fn markJobState(app: *App, alloc: std.mem.Allocator, job: ReplJob, root: *std.json.Value, state: []const u8, reason: ?[]const u8, failures: u32) void {
-    const rdb = (app.getDb("_replicator") catch null) orelse return;
+    const rdb = (app.acquireDb("_replicator") catch null) orelse return;
+    defer app.releaseDb(rdb);
     const doc = rdb.docs.get(job.id) orelse return;
+    const leaf = doc.winnerLeaf();
+    if (leaf.deleted or !leaf.rev.eql(job.rev)) return;
     markReplicationState(alloc, rdb, doc, root, state, reason, failures);
 }
 
@@ -6189,23 +6931,38 @@ fn freeFilterIds(alloc: std.mem.Allocator, ids: *std.StringHashMapUnmanaged(void
 }
 
 fn longpollScheduler(app: *App) void {
-    const alloc = std.heap.page_allocator;
+    const WorkItem = struct {
+        is_longpoll: bool,
+        lp: ?*LongpollCtx = null,
+        cont: ?*ContinuousCtx = null,
+        bytes: ?[]u8 = null,
+        finish: bool = false,
+        send_heartbeat: bool = false,
+    };
+    const max_feed_pending: usize = 4 * 1024 * 1024;
+    var tick_arena = std.heap.ArenaAllocator.init(app.alloc);
+    defer tick_arena.deinit();
+
     while (true) {
         sleepMs(app.io, 50);
+        _ = tick_arena.reset(.retain_capacity);
+        const alloc = tick_arena.allocator();
+        var work: std.ArrayListUnmanaged(WorkItem) = .empty;
+
+        // Phase 1: snapshot pending payloads under feed_mutex + per-Db mutex.
         app.feed_mutex.lockUncancelable(app.io);
-        var i: usize = 0;
-        while (i < app.longpolls.items.len) {
-            const ctx = app.longpolls.items[i];
+        for (app.longpolls.items) |ctx| {
+            if (ctx.in_flight or ctx.closing) continue;
             ctx.elapsed += 50;
             var body: ?[]u8 = null;
             var finished = false;
 
-            app.mutex.lockUncancelable(app.io);
+            ctx.db.lock();
             if (ctx.db.seq > ctx.baseline) {
                 var filter_ids: ?std.StringHashMapUnmanaged(void) = null;
                 var filter_failed = false;
                 if (ctx.filter_spec) |spec| {
-                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.baseline) catch null;
+                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.baseline, ctx.filter_query_json) catch null;
                     filter_failed = filter_ids == null;
                 }
                 if (!filter_failed) {
@@ -6218,100 +6975,162 @@ fn longpollScheduler(app: *App) void {
                     finished = true;
                 }
             }
-            app.mutex.unlock(app.io);
-
             if (!finished and ctx.elapsed >= ctx.timeout_ms) {
-                app.mutex.lockUncancelable(app.io);
                 var filter_ids: ?std.StringHashMapUnmanaged(void) = null;
                 var filter_failed = false;
                 if (ctx.filter_spec) |spec| {
-                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.baseline) catch null;
+                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.baseline, ctx.filter_query_json) catch null;
                     filter_failed = filter_ids == null;
                 }
                 if (!filter_failed) {
                     body = renderChanges(alloc, ctx.db, ctx.baseline, ctx.limit, ctx.include_docs, ctx.style_all, filter_ids) catch null;
                     if (filter_ids) |*ids| freeFilterIds(alloc, ids);
                 }
-                app.mutex.unlock(app.io);
                 finished = true;
             }
+            ctx.db.unlock();
 
-            if (!finished) {
-                i += 1;
-                continue;
+            if (finished) {
+                ctx.in_flight = true;
+                work.append(alloc, .{
+                    .is_longpoll = true,
+                    .lp = ctx,
+                    .bytes = body,
+                    .finish = true,
+                }) catch {
+                    ctx.in_flight = false;
+                };
             }
-
-            _ = app.longpolls.orderedRemove(i);
-            if (body) |b| {
-                writeChunk(ctx.stream, ctx.io, b);
-                alloc.free(b);
-            }
-            ctx.stream.close(ctx.io);
-            if (ctx.filter_spec) |f| ctx.alloc.free(f);
-            ctx.alloc.destroy(ctx);
-            _ = app.feed_threads.fetchSub(1, .monotonic);
         }
-        // Continuous feeds share this scheduler and the same feed list; keep
-        // feed_mutex held until the whole sweep is complete.
-        // Continuous feeds emit new changes or a heartbeat.
-        var ci: usize = 0;
-        while (ci < app.continuous.items.len) {
-            const ctx = app.continuous.items[ci];
+
+        for (app.continuous.items) |ctx| {
+            if (ctx.in_flight or ctx.closing) continue;
             ctx.elapsed += 50;
             var line: std.ArrayListUnmanaged(u8) = .empty;
             var finished = false;
 
-            app.mutex.lockUncancelable(app.io);
+            ctx.db.lock();
             if (ctx.db.seq > ctx.last) {
                 var filter_ids: ?std.StringHashMapUnmanaged(void) = null;
                 var filter_failed = false;
                 if (ctx.filter_spec) |spec| {
-                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.last) catch null;
+                    filter_ids = buildFilterIds(ctx.db, alloc, spec, ctx.last, ctx.filter_query_json) catch null;
                     filter_failed = filter_ids == null;
                 }
                 if (filter_failed) {
                     finished = true;
                 } else {
                     var arr: std.ArrayListUnmanaged(*Doc) = .empty;
+                    defer arr.deinit(alloc);
+                    var build_ok = true;
                     var it = ctx.db.docs.valueIterator();
                     while (it.next()) |d| {
                         if (d.*.seq <= ctx.last) continue;
                         if (filter_ids) |ids| {
                             if (!ids.contains(d.*.id)) continue;
                         }
-                        arr.append(alloc, d.*) catch {};
+                        arr.append(alloc, d.*) catch {
+                            build_ok = false;
+                            break;
+                        };
                     }
-                    sortBySeq(arr.items);
-                    for (arr.items) |d| {
-                        appendChangeObject(ctx.db, &line, alloc, d, ctx.include_docs, ctx.style_all) catch {};
-                        line.append(alloc, '\n') catch {};
+                    if (build_ok) {
+                        sortBySeq(arr.items);
+                        for (arr.items) |d| {
+                            appendChangeObject(ctx.db, &line, alloc, d, ctx.include_docs, ctx.style_all) catch {
+                                build_ok = false;
+                                break;
+                            };
+                            line.append(alloc, '\n') catch {
+                                build_ok = false;
+                                break;
+                            };
+                            if (line.items.len > max_feed_pending) {
+                                finished = true;
+                                break;
+                            }
+                        }
                     }
-                    arr.deinit(alloc);
                     if (filter_ids) |*ids| freeFilterIds(alloc, ids);
-                    ctx.last = ctx.db.seq;
+                    if (build_ok) {
+                        ctx.last = ctx.db.seq;
+                    } else {
+                        line.clearRetainingCapacity();
+                    }
                 }
             }
-            app.mutex.unlock(app.io);
-
-            if (line.items.len > 0) {
-                if (!writeChunkPart(ctx.stream, ctx.io, line.items)) finished = true;
-            } else if (ctx.elapsed % 1000 == 0) {
-                if (!writeChunkPart(ctx.stream, ctx.io, "\n")) finished = true;
-            }
-            line.deinit(alloc);
+            ctx.db.unlock();
 
             if (ctx.elapsed >= ctx.timeout_ms) finished = true;
-            if (!finished) {
-                ci += 1;
-                continue;
+            const send_hb = line.items.len == 0 and !finished and ctx.elapsed % 1000 == 0;
+            if (line.items.len > 0 or send_hb or finished) {
+                ctx.in_flight = true;
+                work.append(alloc, .{
+                    .is_longpoll = false,
+                    .cont = ctx,
+                    .bytes = if (line.items.len > 0) line.items else null,
+                    .finish = finished,
+                    .send_heartbeat = send_hb,
+                }) catch {
+                    ctx.in_flight = false;
+                };
             }
+        }
+        app.feed_mutex.unlock(app.io);
 
-            _ = app.continuous.orderedRemove(ci);
-            finishChunks(ctx.stream, ctx.io);
-            ctx.stream.close(ctx.io);
-            if (ctx.filter_spec) |f| ctx.alloc.free(f);
-            ctx.alloc.destroy(ctx);
-            _ = app.feed_threads.fetchSub(1, .monotonic);
+        if (work.items.len == 0) continue;
+
+        // Phase 2: write to sockets with feed_mutex released so a stalled
+        // consumer cannot block feed registration or other feeds/workers.
+        for (work.items) |*item| {
+            if (item.is_longpoll) {
+                const ctx = item.lp.?;
+                if (!ctx.closing) {
+                    if (item.bytes) |b| writeChunk(ctx.stream, ctx.io, b);
+                }
+            } else {
+                const ctx = item.cont.?;
+                var write_ok = !ctx.closing;
+                if (write_ok) {
+                    if (item.bytes) |b| {
+                        if (!writeChunkPart(ctx.stream, ctx.io, b)) write_ok = false;
+                    } else if (item.send_heartbeat) {
+                        if (!writeChunkPart(ctx.stream, ctx.io, "\n")) write_ok = false;
+                    }
+                    if (write_ok and item.finish) finishChunks(ctx.stream, ctx.io);
+                }
+                if (!write_ok) item.finish = true;
+            }
+        }
+
+        // Phase 3: retire completed, failed, or closing contexts under feed_mutex.
+        app.feed_mutex.lockUncancelable(app.io);
+        for (work.items) |item| {
+            if (item.is_longpoll) {
+                const ctx = item.lp.?;
+                ctx.in_flight = false;
+                if (std.mem.indexOfScalar(*LongpollCtx, app.longpolls.items, ctx)) |idx| {
+                    _ = app.longpolls.orderedRemove(idx);
+                }
+                ctx.stream.close(ctx.io);
+                if (ctx.filter_spec) |f| ctx.alloc.free(f);
+                if (ctx.filter_query_json) |fq| ctx.alloc.free(fq);
+                ctx.alloc.destroy(ctx);
+                _ = app.feed_threads.fetchSub(1, .monotonic);
+            } else {
+                const ctx = item.cont.?;
+                ctx.in_flight = false;
+                if (item.finish or ctx.closing) {
+                    if (std.mem.indexOfScalar(*ContinuousCtx, app.continuous.items, ctx)) |idx| {
+                        _ = app.continuous.orderedRemove(idx);
+                    }
+                    ctx.stream.close(ctx.io);
+                    if (ctx.filter_spec) |f| ctx.alloc.free(f);
+                    if (ctx.filter_query_json) |fq| ctx.alloc.free(fq);
+                    ctx.alloc.destroy(ctx);
+                    _ = app.feed_threads.fetchSub(1, .monotonic);
+                }
+            }
         }
         app.feed_mutex.unlock(app.io);
     }
@@ -6327,17 +7146,13 @@ fn hChangesLongpoll(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     var timeout_ms: usize = if (q(req, "timeout")) |v| (std.fmt.parseInt(usize, v, 10) catch 25000) else 25000;
     if (timeout_ms == 0 or timeout_ms > 60000) timeout_ms = 60000;
 
-    app.mutex.lockUncancelable(app.io);
-    const db = (try app.getDb(name)) orelse {
-        app.mutex.unlock(app.io);
-        return err(res, 404, "not_found", "Database does not exist.");
-    };
+    const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+    var db_held = true;
+    defer if (db_held) app.releaseDb(db);
     if (filter_spec) |spec| {
-        _ = buildFilterIds(db, res.arena, spec, 0) catch |e| {
-            app.mutex.unlock(app.io);
+        validateFilterExists(db, res.arena, spec) catch |e| {
             return switch (e) {
                 error.FilterNotFound => err(res, 404, "not_found", "missing filter"),
-                error.FilterError => err(res, 500, "filter_error", "filter function failed"),
                 else => e,
             };
         };
@@ -6346,7 +7161,8 @@ fn hChangesLongpoll(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
         (if (std.mem.eql(u8, v, "now")) db.seq else (std.fmt.parseInt(u64, v, 10) catch 0))
     else
         0;
-    app.mutex.unlock(app.io);
+    app.releaseDb(db);
+    db_held = false;
 
     const active = app.feed_threads.fetchAdd(1, .monotonic);
     if (active >= app.max_feeds) {
@@ -6361,9 +7177,12 @@ fn hChangesLongpoll(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     const alloc = std.heap.page_allocator;
     const filter_copy: ?[]u8 = if (filter_spec) |f| try alloc.dupe(u8, f) else null;
     errdefer if (filter_copy) |f| alloc.free(f);
+    const query_copy: ?[]u8 = if (filter_spec != null) try buildQueryJson(alloc, req) else null;
+    errdefer if (query_copy) |fq| alloc.free(fq);
     const ctx = try alloc.create(LongpollCtx);
     errdefer alloc.destroy(ctx);
     const stream = try startJsonChunked(res);
+    setSocketTimeout(stream.socket.handle, std.posix.SO.SNDTIMEO, 1);
     ctx.* = .{
         .app = app,
         .db = db,
@@ -6376,6 +7195,7 @@ fn hChangesLongpoll(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
         .style_all = style_all,
         .timeout_ms = timeout_ms,
         .filter_spec = filter_copy,
+        .filter_query_json = query_copy,
     };
     app.feed_mutex.lockUncancelable(app.io);
     // See hChangesContinuous: refuse to publish a context whose database was
@@ -6442,7 +7262,7 @@ fn renderChanges(alloc: std.mem.Allocator, db: *Db, since: u64, limit: usize, in
             if (filter_ids) |ids| {
                 if (!ids.contains(d.*.id)) continue;
             }
-            arr.append(alloc, d.*) catch {};
+            try arr.append(alloc, d.*);
         }
     }
     sortBySeq(arr.items);
@@ -6522,11 +7342,101 @@ fn queryJsonString(alloc: std.mem.Allocator, s: []const u8) ?[]const u8 {
     return parsed.value.string;
 }
 
+fn allDocsOptString(req: *httpz.Request, alloc: std.mem.Allocator, obj: ?std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (q(req, key)) |v| return queryJsonString(alloc, v);
+    if (obj) |o| {
+        if (o.get(key)) |v| {
+            if (v == .string) return v.string;
+        }
+    }
+    return null;
+}
+
 fn hAllDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const include_docs = if (q(req, "include_docs")) |v| std.mem.eql(u8, v, "true") else false;
-    const limit: usize = if (q(req, "limit")) |s| (std.fmt.parseInt(usize, s, 10) catch 0) else 0;
-    const skip: usize = if (q(req, "skip")) |s| (std.fmt.parseInt(usize, s, 10) catch 0) else 0;
+    var body_obj: ?std.json.ObjectMap = null;
+    if (req.method == .POST) {
+        const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
+        if (body.len > 0) {
+            const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
+            if (root != .object) return err(res, 400, "bad_request", "JSON object required");
+            body_obj = root.object;
+        }
+    }
+    const include_docs = bodyOrQueryBool(req, body_obj, "include_docs", false);
+    const limit: usize = bodyOrQueryUsize(req, body_obj, "limit", 0);
+    const skip: usize = bodyOrQueryUsize(req, body_obj, "skip", 0);
+    const descending = bodyOrQueryBool(req, body_obj, "descending", false);
+    const inclusive_end = bodyOrQueryBool(req, body_obj, "inclusive_end", true);
+    const key = allDocsOptString(req, res.arena, body_obj, "key");
+    const startkey = allDocsOptString(req, res.arena, body_obj, "startkey");
+    const endkey = allDocsOptString(req, res.arena, body_obj, "endkey");
+
+    var keys_val: ?std.json.Value = null;
+    if (body_obj) |o| {
+        if (o.get("keys")) |kv| keys_val = kv;
+    }
+    if (keys_val == null) {
+        if (q(req, "keys")) |kv| {
+            const parsed = std.json.parseFromSlice(std.json.Value, res.arena, kv, .{}) catch
+                return err(res, 400, "bad_request", "invalid keys");
+            keys_val = parsed.value;
+        }
+    }
+    if (keys_val) |kv| {
+        if (kv != .array) return err(res, 400, "bad_request", "keys must be an array");
+        for (kv.array.items) |item| {
+            if (item != .string) return err(res, 400, "bad_request", "keys must be strings");
+        }
+        const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
+        defer app.releaseDb(db);
+
+        const total_keys = kv.array.items.len;
+        const start = @min(skip, total_keys);
+        var end = total_keys;
+        if (limit > 0 and end - start > limit) end = start + limit;
+
+        var l: std.ArrayListUnmanaged(u8) = .empty;
+        try l.appendSlice(res.arena, "{\"total_rows\":");
+        try appendInt(&l, res.arena, db.count());
+        try l.appendSlice(res.arena, ",\"offset\":null,\"rows\":[");
+        var i = start;
+        var out_i: usize = 0;
+        while (i < end) : (i += 1) {
+            const kitem = kv.array.items[if (descending) (total_keys - 1 - i) else i];
+            const k = kitem.string;
+            if (out_i != 0) try l.append(res.arena, ',');
+            out_i += 1;
+            const doc = db.get(k);
+            if (doc == null) {
+                try l.appendSlice(res.arena, "{\"key\":");
+                try jsonw.writeString(&l, res.arena, k);
+                try l.appendSlice(res.arena, ",\"error\":\"not_found\"}");
+                continue;
+            }
+            var rb: [64]u8 = undefined;
+            try l.appendSlice(res.arena, "{\"id\":");
+            try jsonw.writeString(&l, res.arena, doc.?.id);
+            try l.appendSlice(res.arena, ",\"key\":");
+            try jsonw.writeString(&l, res.arena, k);
+            try l.appendSlice(res.arena, ",\"value\":{\"rev\":");
+            try jsonw.writeString(&l, res.arena, doc.?.winnerLeaf().rev.write(&rb));
+            if (doc.?.winnerLeaf().deleted) {
+                try l.appendSlice(res.arena, ",\"deleted\":true},\"doc\":null");
+            } else {
+                try l.append(res.arena, '}');
+                if (include_docs) {
+                    try l.appendSlice(res.arena, ",\"doc\":");
+                    try writeDoc(db, &l, res.arena, doc.?, doc.?.winner, true, false, false);
+                }
+            }
+            try l.append(res.arena, '}');
+        }
+        try l.appendSlice(res.arena, "]}");
+        res.content_type = .JSON;
+        res.body = l.items;
+        return;
+    }
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
@@ -6535,15 +7445,9 @@ fn hAllDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer arr.deinit(res.arena);
     var it = db.docs.valueIterator();
     while (it.next()) |d| {
-        if (!d.*.winnerLeaf().deleted) arr.append(res.arena, d.*) catch {};
+        if (!d.*.winnerLeaf().deleted) try arr.append(res.arena, d.*);
     }
     sortById(arr.items);
-
-    const descending = if (q(req, "descending")) |v| std.mem.eql(u8, v, "true") else false;
-    const inclusive_end = if (q(req, "inclusive_end")) |v| !std.mem.eql(u8, v, "false") else true;
-    const key = if (q(req, "key")) |v| queryJsonString(res.arena, v) else null;
-    const startkey = if (q(req, "startkey")) |v| queryJsonString(res.arena, v) else null;
-    const endkey = if (q(req, "endkey")) |v| queryJsonString(res.arena, v) else null;
 
     var filtered: std.ArrayListUnmanaged(*Doc) = .empty;
     defer filtered.deinit(res.arena);
@@ -6565,7 +7469,7 @@ fn hAllDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 } else if (!std.mem.lessThan(u8, ek, d.id)) continue;
             }
         }
-        filtered.append(res.arena, d) catch {};
+        try filtered.append(res.arena, d);
     }
     if (descending) std.mem.reverse(*Doc, filtered.items);
 
@@ -6615,7 +7519,7 @@ fn hRevsLimitGet(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 fn hRevsLimitPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .integer or root.integer <= 0 or root.integer > 1_000_000) {
         return err(res, 400, "bad_request", "invalid revs limit");
@@ -6628,53 +7532,7 @@ fn hRevsLimitPut(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 fn hAllDocsKeys(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
-    const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
-    if (root != .object) return err(res, 400, "bad_request", "JSON object required");
-    const keys = root.object.get("keys") orelse return err(res, 400, "bad_request", "missing keys");
-    if (keys != .array) return err(res, 400, "bad_request", "keys must be an array");
-    const include_docs = if (q(req, "include_docs")) |v| std.mem.eql(u8, v, "true") else false;
-
-    const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
-    defer app.releaseDb(db);
-
-    var l: std.ArrayListUnmanaged(u8) = .empty;
-    try l.appendSlice(res.arena, "{\"total_rows\":");
-    try appendInt(&l, res.arena, db.count());
-    try l.appendSlice(res.arena, ",\"offset\":null,\"rows\":[");
-    for (keys.array.items, 0..) |kv, i| {
-        if (i != 0) try l.append(res.arena, ',');
-        if (kv != .string) continue;
-        const key = kv.string;
-        const doc = db.get(key);
-        if (doc == null) {
-            try l.appendSlice(res.arena, "{\"key\":");
-            try jsonw.writeString(&l, res.arena, key);
-            try l.appendSlice(res.arena, ",\"error\":\"not_found\"}");
-            continue;
-        }
-        var rb: [64]u8 = undefined;
-        try l.appendSlice(res.arena, "{\"id\":");
-        try jsonw.writeString(&l, res.arena, doc.?.id);
-        try l.appendSlice(res.arena, ",\"key\":");
-        try jsonw.writeString(&l, res.arena, key);
-        try l.appendSlice(res.arena, ",\"value\":{\"rev\":");
-        try jsonw.writeString(&l, res.arena, doc.?.winnerLeaf().rev.write(&rb));
-        if (doc.?.winnerLeaf().deleted) {
-            try l.appendSlice(res.arena, ",\"deleted\":true},\"doc\":null");
-        } else {
-            try l.append(res.arena, '}');
-            if (include_docs) {
-                try l.appendSlice(res.arena, ",\"doc\":");
-                try writeDoc(db, &l, res.arena, doc.?, doc.?.winner, true, false, false);
-            }
-        }
-        try l.append(res.arena, '}');
-    }
-    try l.appendSlice(res.arena, "]}");
-    res.content_type = .JSON;
-    res.body = l.items;
+    return hAllDocs(app, req, res);
 }
 
 const VecHit = struct { doc: *Doc, score: f32 };
@@ -6845,8 +7703,7 @@ fn persistHnsw(app: *App, db: *Db, cache: *VectorCache) void {
 }
 
 fn checkVectorBudget(app: *App, vector_count: usize, dim: usize) !void {
-    if (vector_count == 0) return;
-    if (app.vector_index_mb == 0) return error.VectorIndexLimitExceeded;
+    if (vector_count == 0 or app.vector_index_mb == 0) return;
     const budget = std.math.mul(usize, app.vector_index_mb, 1024 * 1024) catch std.math.maxInt(usize);
     const per_vec = dim * @sizeOf(f32) + 128;
     const est = std.math.mul(usize, vector_count, per_vec) catch return error.VectorIndexLimitExceeded;
@@ -6914,7 +7771,10 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
     }
 
     if (try db.readHnswIndex()) |bytes| {
+        defer db.alloc.free(bytes);
         if (loadHnswFile(app.alloc, bytes, dim)) |loaded| {
+            var published = false;
+            errdefer if (!published) destroyVectorCache(app.alloc, loaded);
             if (loaded.seq == db.seq) {
                 var revs_ok = true;
                 for (loaded.ids.items) |id| {
@@ -6929,18 +7789,22 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
                     try loaded.revs.append(app.alloc, d.winnerLeaf().rev);
                 }
                 if (revs_ok) {
-                    errdefer destroyVectorCache(app.alloc, loaded);
                     try checkVectorBudget(app, loaded.ids.items.len, dim);
                     app.mutex.lockUncancelable(app.io);
                     defer app.mutex.unlock(app.io);
+                    if (app.vector_cache.fetchRemove(cache_key)) |old| {
+                        destroyVectorCache(app.alloc, old.value);
+                        app.alloc.free(old.key);
+                    }
                     try app.vector_cache.put(app.alloc, cache_key, loaded);
+                    published = true;
                     return loaded;
                 }
             }
             destroyVectorCache(app.alloc, loaded);
+            published = true;
         } else |e| {
             if (e == error.DimensionMismatch or e == error.InvalidVector) return e;
-            // loadHnswFile took ownership of `bytes` and released it.
         }
     }
 
@@ -6972,8 +7836,8 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
     // Release db.mutex while building the HNSW graph so concurrent DB reads/writes
     // are not blocked. db remains pinned by acquireDb.
     var mutex_held = false;
-    db.mutex.unlock(app.io);
-    defer if (!mutex_held) db.mutex.lockUncancelable(app.io);
+    db.unlock();
+    defer if (!mutex_held) db.lock();
 
     const task_pid = app.beginTask("indexer", name, "_design/vector", null, null, null, snap_vecs.items.len);
     defer app.endTask(task_pid);
@@ -6993,7 +7857,7 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
         if ((si & 63) == 63) app.updateTask(task_pid, si + 1, snap_vecs.items.len);
     }
 
-    db.mutex.lockUncancelable(app.io);
+    db.lock();
     mutex_held = true;
 
     if (db.seq == snap_seq) {
@@ -7002,6 +7866,10 @@ fn hnswFor(app: *App, db: *Db, dim: usize, name: []const u8) !*VectorCache {
 
     app.mutex.lockUncancelable(app.io);
     defer app.mutex.unlock(app.io);
+    if (app.vector_cache.fetchRemove(cache_key)) |old| {
+        destroyVectorCache(app.alloc, old.value);
+        app.alloc.free(old.key);
+    }
     try app.vector_cache.put(app.alloc, cache_key, cache);
     return cache;
 }
@@ -7020,7 +7888,7 @@ fn cosineFromBody(alloc: std.mem.Allocator, body: []const u8, query: []const f32
 fn hVectorSearch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const started = Io.Timestamp.now(app.io, .awake);
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const k: usize = if (root.object.get("k")) |kv|
@@ -7118,7 +7986,7 @@ fn hVectorSearch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                         const parsed = std.json.parseFromSlice(std.json.Value, res.arena, d.winnerLeaf().body, .{}) catch continue;
                         if (!matchSelector(parsed.value, fsel)) continue;
                     }
-                    hits.append(res.arena, .{ .doc = d, .score = h.score }) catch {};
+                    try hits.append(res.arena, .{ .doc = d, .score = h.score });
                 }
             }
         }
@@ -7134,7 +8002,7 @@ fn hVectorSearch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                     if (!matchSelector(parsed.value, fsel)) continue;
                 }
                 const score = quantizedCosine(qvec, entry) orelse continue;
-                hits.append(res.arena, .{ .doc = d, .score = score }) catch {};
+                try hits.append(res.arena, .{ .doc = d, .score = score });
             }
         }
     }
@@ -7147,7 +8015,7 @@ fn hVectorSearch(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 if (!matchSelector(parsed.value, fsel)) continue;
             }
             if (try cosineFromBody(res.arena, d.*.winnerLeaf().body, query)) |score| {
-                hits.append(res.arena, .{ .doc = d.*, .score = score }) catch {};
+                try hits.append(res.arena, .{ .doc = d.*, .score = score });
             }
         }
     }
@@ -7709,12 +8577,12 @@ fn buildMangoIndexFieldsOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: st
     }
 
     var mutex_held = true;
-    if (app) |a| {
+    if (app != null) {
         mutex_held = false;
-        db.mutex.unlock(a.io);
+        db.unlock();
     }
     defer if (!mutex_held) {
-        if (app) |a| db.mutex.lockUncancelable(a.io);
+        if (app != null) db.lock();
     };
     const task_pid = if (app) |a| a.beginTask("indexer", db_name orelse "", "_design/zouch", null, null, null, snap_docs.items.len) else 0;
     defer if (app) |a| a.endTask(task_pid);
@@ -7769,8 +8637,8 @@ fn buildMangoIndexFieldsOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: st
     const name = try mangoIndexNameWithFilter(alloc, fields, partial_filter);
     defer alloc.free(name);
 
-    if (app) |a| {
-        db.mutex.lockUncancelable(a.io);
+    if (app != null) {
+        db.lock();
         mutex_held = true;
     }
     if (db.seq == snap_seq) {
@@ -7839,12 +8707,12 @@ fn buildMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.
     }
 
     var mutex_held = true;
-    if (app) |a| {
+    if (app != null) {
         mutex_held = false;
-        db.mutex.unlock(a.io);
+        db.unlock();
     }
     defer if (!mutex_held) {
-        if (app) |a| db.mutex.lockUncancelable(a.io);
+        if (app != null) db.lock();
     };
     const task_pid = if (app) |a| a.beginTask("indexer", db_name orelse "", "_design/zouch", null, null, null, snap_docs.items.len) else 0;
     defer if (app) |a| a.endTask(task_pid);
@@ -7855,7 +8723,7 @@ fn buildMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.
             if (!matchSelector(parsed.value, pfs)) continue;
         }
         const key = valueAtPath(parsed.value, field) orelse continue;
-        rows.append(alloc, .{ .id = sd.id, .key = key }) catch {};
+        try rows.append(alloc, .{ .id = sd.id, .key = key });
         if ((si & 63) == 63) {
             if (app) |a| a.updateTask(task_pid, si + 1, snap_docs.items.len);
         }
@@ -7866,6 +8734,8 @@ fn buildMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.
     defer l.deinit(alloc);
     try l.appendSlice(alloc, "{\"version\":2,\"db_seq\":");
     try appendInt(&l, alloc, snap_seq);
+    try l.appendSlice(alloc, ",\"purge_seq\":");
+    try appendInt(&l, alloc, db.purge_seq);
     try l.appendSlice(alloc, ",\"field\":");
     try jsonw.writeString(&l, alloc, field);
     try l.appendSlice(alloc, ",\"rows\":[");
@@ -7881,8 +8751,8 @@ fn buildMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.
     const name = try mangoIndexNameWithFilter(alloc, &.{field}, partial_filter);
     defer alloc.free(name);
 
-    if (app) |a| {
-        db.mutex.lockUncancelable(a.io);
+    if (app != null) {
+        db.lock();
         mutex_held = true;
     }
     if (db.seq == snap_seq) {
@@ -7898,6 +8768,88 @@ fn loadMangoIndexWithFilter(db: *Db, alloc: std.mem.Allocator, field: []const u8
     return loadMangoIndexOpt(null, db, null, alloc, field, partial_filter);
 }
 
+fn tryIncrementalMangoIndex(
+    db: *Db,
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    field: []const u8,
+    partial_filter: ?std.json.Value,
+    cached_val: std.json.Value,
+    cached_seq: u64,
+) !?std.json.Value {
+    const cached_rows_v = cached_val.object.get("rows") orelse return null;
+    if (cached_rows_v != .array) return null;
+    const cached_purge: u64 = if (cached_val.object.get("purge_seq")) |pv|
+        (if (pv == .integer and pv.integer >= 0) @intCast(pv.integer) else return null)
+    else
+        0;
+    if (cached_purge != db.purge_seq) return null;
+
+    var changed_count: usize = 0;
+    var cnt_it = db.docs.valueIterator();
+    while (cnt_it.next()) |d| {
+        if (d.*.seq > cached_seq) changed_count += 1;
+    }
+    if (changed_count == 0 or changed_count * 2 >= db.docs.count()) return null;
+
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var changed: std.StringHashMapUnmanaged(void) = .empty;
+    var rows: std.ArrayListUnmanaged(IdxRow) = .empty;
+    defer rows.deinit(alloc);
+
+    var doc_it = db.docs.valueIterator();
+    while (doc_it.next()) |d| {
+        if (d.*.seq <= cached_seq) continue;
+        try changed.put(sa, d.*.id, {});
+        if (d.*.winnerLeaf().deleted) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, sa, d.*.winnerLeaf().body, .{}) catch continue;
+        if (partial_filter) |pfs| {
+            if (!matchSelector(parsed.value, pfs)) continue;
+        }
+        const key = valueAtPath(parsed.value, field) orelse continue;
+        try rows.append(alloc, .{ .id = d.*.id, .key = key });
+    }
+
+    for (cached_rows_v.array.items) |row| {
+        if (row != .object) continue;
+        const id_v = row.object.get("id") orelse continue;
+        const key_v = row.object.get("key") orelse continue;
+        if (id_v != .string) continue;
+        if (changed.contains(id_v.string)) continue;
+        try rows.append(alloc, .{ .id = id_v.string, .key = key_v });
+    }
+
+    std.mem.sort(IdxRow, rows.items, {}, idxRowLess);
+
+    var l: std.ArrayListUnmanaged(u8) = .empty;
+    defer l.deinit(alloc);
+    try l.appendSlice(alloc, "{\"version\":2,\"db_seq\":");
+    try appendInt(&l, alloc, db.seq);
+    try l.appendSlice(alloc, ",\"purge_seq\":");
+    try appendInt(&l, alloc, db.purge_seq);
+    try l.appendSlice(alloc, ",\"field\":");
+    try jsonw.writeString(&l, alloc, field);
+    try l.appendSlice(alloc, ",\"rows\":[");
+    for (rows.items, 0..) |row, i| {
+        if (i != 0) try l.append(alloc, ',');
+        try l.appendSlice(alloc, "{\"id\":");
+        try jsonw.writeString(&l, alloc, row.id);
+        try l.appendSlice(alloc, ",\"key\":");
+        try jsonw.writeValue(&l, alloc, row.key);
+        try l.append(alloc, '}');
+    }
+    try l.appendSlice(alloc, "]}");
+    try db.writeMangoIndex(name, l.items);
+
+    const updated_bytes = (try db.readMangoIndex(alloc, name)) orelse return null;
+    const parsed_updated = std.json.parseFromSlice(std.json.Value, alloc, updated_bytes, .{}) catch return null;
+    if (parsed_updated.value != .object) return null;
+    return parsed_updated.value;
+}
+
 fn loadMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.Allocator, field: []const u8, partial_filter: ?std.json.Value) ?std.json.Value {
     const name = mangoIndexNameWithFilter(alloc, &.{field}, partial_filter) catch return null;
     const first = db.readMangoIndex(alloc, name) catch return null;
@@ -7908,6 +8860,11 @@ fn loadMangoIndexOpt(app: ?*App, db: *Db, db_name: ?[]const u8, alloc: std.mem.A
         if (ver != null and ver.? == .integer and ver.?.integer == 2) {
             if (parsed_first.value.object.get("db_seq")) |sv| {
                 if (sv == .integer and sv.integer == @as(i64, @intCast(db.seq))) return parsed_first.value;
+                if (sv == .integer and sv.integer > 0 and sv.integer < @as(i64, @intCast(db.seq))) {
+                    if (tryIncrementalMangoIndex(db, alloc, name, field, partial_filter, parsed_first.value, @intCast(sv.integer)) catch null) |inc| {
+                        return inc;
+                    }
+                }
             }
         }
     }
@@ -8120,8 +9077,8 @@ fn textCacheFor(app: *App, db: *Db, name: []const u8) !*TextCache {
             app.alloc.free(old.key);
         }
     }
-    if (db.readTextIndex() catch null) |bytes| {
-        defer app.alloc.free(bytes);
+    if (try db.readTextIndex()) |bytes| {
+        defer db.alloc.free(bytes);
         if (loadTextFile(app.alloc, bytes)) |loaded| {
             if (loaded.seq == db.seq) {
                 const key = try app.alloc.dupe(u8, name);
@@ -8132,6 +9089,11 @@ fn textCacheFor(app: *App, db: *Db, name: []const u8) !*TextCache {
                 }
                 app.mutex.lockUncancelable(app.io);
                 defer app.mutex.unlock(app.io);
+                if (app.text_cache.fetchRemove(name)) |old| {
+                    old.value.deinit();
+                    app.alloc.destroy(old.value);
+                    app.alloc.free(old.key);
+                }
                 try app.text_cache.put(app.alloc, key, loaded);
                 return loaded;
             }
@@ -8158,6 +9120,11 @@ fn textCacheFor(app: *App, db: *Db, name: []const u8) !*TextCache {
     errdefer app.alloc.free(key);
     app.mutex.lockUncancelable(app.io);
     defer app.mutex.unlock(app.io);
+    if (app.text_cache.fetchRemove(name)) |old| {
+        old.value.deinit();
+        app.alloc.destroy(old.value);
+        app.alloc.free(old.key);
+    }
     try app.text_cache.put(app.alloc, key, cache);
     return cache;
 }
@@ -8220,7 +9187,7 @@ fn textCandidates(app: *App, db: *Db, name: []const u8, query: []const u8, arena
 
 fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const sel = root.object.get("selector") orelse return err(res, 400, "bad_request", "missing selector");
@@ -8230,7 +9197,7 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         return err(res, 400, "invalid_operator", reason);
     }
     const limit: usize = if (root.object.get("limit")) |v|
-        (if (v == .integer and v.integer > 0) @intCast(@min(v.integer, 10000)) else 25)
+        (if (v == .integer and v.integer > 0) (std.math.cast(usize, v.integer) orelse std.math.maxInt(usize)) else 25)
     else
         25;
     const skip: usize = if (root.object.get("skip")) |v|
@@ -8398,16 +9365,15 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 defer ids.deinit(res.arena);
                 if (rows_v) |rv| {
                     if (rv == .array) {
-                        for (rv.array.items) |row| {
-                            examined_keys += 1;
-                            if (row != .object) continue;
-                            const id_v = row.object.get("id") orelse continue;
-                            const key_v = row.object.get("key") orelse continue;
-                            if (id_v != .string) continue;
-                            var last_key: std.json.Value = undefined;
-                            if (uf.len == 1) {
-                                last_key = key_v;
-                            } else {
+                        if (uf.len == 1) {
+                            try collectMangoRangeIds(rv.array.items, last_eq, last_lower, last_lower_incl, last_upper, last_upper_incl, &examined_keys, res.arena, &ids);
+                        } else {
+                            for (rv.array.items) |row| {
+                                examined_keys += 1;
+                                if (row != .object) continue;
+                                const id_v = row.object.get("id") orelse continue;
+                                const key_v = row.object.get("key") orelse continue;
+                                if (id_v != .string) continue;
                                 if (key_v != .array or key_v.array.items.len != uf.len) continue;
                                 var prefix_ok = true;
                                 for (prefix_vals.items, 0..) |pv, pi| {
@@ -8417,20 +9383,20 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                                     }
                                 }
                                 if (!prefix_ok) continue;
-                                last_key = key_v.array.items[uf.len - 1];
+                                const last_key = key_v.array.items[uf.len - 1];
+                                if (last_eq) |qv| {
+                                    if (valueCmp(last_key, qv) != 0) continue;
+                                }
+                                if (last_lower) |lv| {
+                                    const c = valueCmp(last_key, lv) orelse continue;
+                                    if (if (last_lower_incl) c < 0 else c <= 0) continue;
+                                }
+                                if (last_upper) |uv| {
+                                    const c = valueCmp(last_key, uv) orelse continue;
+                                    if (if (last_upper_incl) c > 0 else c >= 0) continue;
+                                }
+                                try ids.append(res.arena, id_v.string);
                             }
-                            if (last_eq) |qv| {
-                                if (valueCmp(last_key, qv) != 0) continue;
-                            }
-                            if (last_lower) |lv| {
-                                const c = valueCmp(last_key, lv) orelse continue;
-                                if (if (last_lower_incl) c < 0 else c <= 0) continue;
-                            }
-                            if (last_upper) |uv| {
-                                const c = valueCmp(last_key, uv) orelse continue;
-                                if (if (last_upper_incl) c > 0 else c >= 0) continue;
-                            }
-                            try ids.append(res.arena, id_v.string);
                         }
                     }
                 }
@@ -8483,25 +9449,7 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             if (rows_v != .array) continue;
             var ids: std.ArrayListUnmanaged([]const u8) = .empty;
             defer ids.deinit(res.arena);
-            for (rows_v.array.items) |row| {
-                examined_keys += 1;
-                if (row != .object) continue;
-                const id_v = row.object.get("id") orelse continue;
-                const key_v = row.object.get("key") orelse continue;
-                if (id_v != .string) continue;
-                if (eq) |qv| {
-                    if (valueCmp(key_v, qv) != 0) continue;
-                }
-                if (lower) |lv| {
-                    const c = valueCmp(key_v, lv) orelse continue;
-                    if (if (lower_inclusive) c < 0 else c <= 0) continue;
-                }
-                if (upper) |uv| {
-                    const c = valueCmp(key_v, uv) orelse continue;
-                    if (if (upper_inclusive) c > 0 else c >= 0) continue;
-                }
-                ids.append(res.arena, id_v.string) catch {};
-            }
+            try collectMangoRangeIds(rows_v.array.items, eq, lower, lower_inclusive, upper, upper_inclusive, &examined_keys, res.arena, &ids);
             if (field_keys.len == 1 and sort_specs.items.len == 1 and std.mem.eql(u8, sort_field.?, indexed_field)) {
                 for (ids.items) |id| {
                     const d = db.get(id) orelse continue;
@@ -8512,7 +9460,7 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                     const key = valueAtPath(parsed.value, sort_field.?);
                     const keys = try res.arena.alloc(?std.json.Value, 1);
                     keys[0] = key;
-                    matches.append(res.arena, .{ .doc = d, .key = key, .keys = keys }) catch {};
+                    try matches.append(res.arena, .{ .doc = d, .key = key, .keys = keys });
                 }
                 used_index = true;
                 pre_sorted = true;
@@ -8520,12 +9468,12 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             }
             if (candidate_map == null) {
                 var m: std.StringHashMapUnmanaged(void) = .empty;
-                for (ids.items) |id| m.put(res.arena, id, {}) catch {};
+                for (ids.items) |id| try m.put(res.arena, id, {});
                 candidate_map = m;
             } else {
                 var next: std.StringHashMapUnmanaged(void) = .empty;
                 for (ids.items) |id| {
-                    if (candidate_map.?.contains(id)) next.put(res.arena, id, {}) catch {};
+                    if (candidate_map.?.contains(id)) try next.put(res.arena, id, {});
                 }
                 candidate_map.?.deinit(res.arena);
                 candidate_map = next;
@@ -8546,7 +9494,7 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 keys[si] = if (std.mem.eql(u8, sp.field, "_id")) .{ .string = d.id } else valueAtPath(parsed.value, sp.field);
             }
             const key = if (keys.len > 0) keys[0] else null;
-            matches.append(res.arena, .{ .doc = d, .key = key, .keys = keys }) catch {};
+            try matches.append(res.arena, .{ .doc = d, .key = key, .keys = keys });
         }
     }
     if (!used_index) {
@@ -8561,7 +9509,7 @@ fn hFind(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 keys[si] = if (std.mem.eql(u8, sp.field, "_id")) .{ .string = d.*.id } else valueAtPath(parsed.value, sp.field);
             }
             const key = if (keys.len > 0) keys[0] else null;
-            matches.append(res.arena, .{ .doc = d.*, .key = key, .keys = keys }) catch {};
+            try matches.append(res.arena, .{ .doc = d.*, .key = key, .keys = keys });
         }
     }
     if (pre_sorted) {
@@ -8694,13 +9642,44 @@ fn selectorRangesField(sel: std.json.Value, field: []const u8) bool {
     return false;
 }
 
+fn jsonValuesEqual(a: std.json.Value, b: std.json.Value) bool {
+    if (@as(std.meta.Tag(std.json.Value), a) != @as(std.meta.Tag(std.json.Value), b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => |v| v == b.bool,
+        .integer => |v| v == b.integer,
+        .float => |v| v == b.float,
+        .number_string, .string => |v| std.mem.eql(u8, v, switch (b) {
+            .number_string, .string => |s| s,
+            else => unreachable,
+        }),
+        .array => |arr| blk: {
+            if (arr.items.len != b.array.items.len) break :blk false;
+            for (arr.items, b.array.items) |ai, bi| {
+                if (!jsonValuesEqual(ai, bi)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |obj| blk: {
+            if (obj.count() != b.object.count()) break :blk false;
+            for (obj.keys(), obj.values()) |k, v| {
+                const bv = b.object.get(k) orelse break :blk false;
+                if (!jsonValuesEqual(v, bv)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
 fn hIndexCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const auth = try requestAuth(app, req, res);
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
+    if (!isDbAdminFor(db, auth)) return err(res, 403, "forbidden", "You are not a db or server admin.");
 
     const idx_v = root.object.get("index") orelse return err(res, 400, "bad_request", "missing index");
     if (idx_v != .object) return err(res, 400, "bad_request", "index must be an object");
@@ -8729,7 +9708,10 @@ fn hIndexCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
     const index_name = if (root.object.get("name")) |v| (if (v == .string) v.string else "zouch_index") else "zouch_index";
     const ddoc = if (root.object.get("ddoc")) |v| (if (v == .string) v.string else "zouch") else "zouch";
-    const ddoc_id = try std.fmt.allocPrint(res.arena, "_design/{s}", .{ddoc});
+    const ddoc_id = if (std.mem.startsWith(u8, ddoc, "_design/"))
+        try res.arena.dupe(u8, ddoc)
+    else
+        try std.fmt.allocPrint(res.arena, "_design/{s}", .{ddoc});
 
     var doc_obj: std.json.ObjectMap = .empty;
     var parent: ?Rev = null;
@@ -8745,6 +9727,32 @@ fn hIndexCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var indexes: std.json.ObjectMap = .empty;
     if (doc_obj.get("zouch_indexes")) |zi| {
         if (zi == .object) indexes = zi.object;
+    }
+    if (indexes.get(index_name)) |prev_val| {
+        if (prev_val == .object) {
+            const prev_fields = prev_val.object.get("fields") orelse .null;
+            const prev_pfs = prev_val.object.get("partial_filter_selector");
+            const same_fields = jsonValuesEqual(prev_fields, fields_v);
+            const same_pfs = if (prev_pfs == null and pfs_v == null)
+                true
+            else if (prev_pfs != null and pfs_v != null)
+                jsonValuesEqual(prev_pfs.?, pfs_v.?)
+            else
+                false;
+            if (same_fields and same_pfs) {
+                var l: std.ArrayListUnmanaged(u8) = .empty;
+                try l.appendSlice(res.arena, "{\"result\":\"exists\",\"id\":");
+                try jsonw.writeString(&l, res.arena, ddoc_id);
+                try l.appendSlice(res.arena, ",\"name\":");
+                try jsonw.writeString(&l, res.arena, index_name);
+                try l.append(res.arena, '}');
+                res.status = 200;
+                res.content_type = .JSON;
+                res.body = l.items;
+                return;
+            }
+            return err(res, 400, "invalid_index", "Cannot overwrite existing index with different definition");
+        }
     }
     var entry: std.json.ObjectMap = .empty;
     try entry.put(res.arena, "name", .{ .string = index_name });
@@ -8791,7 +9799,7 @@ fn hIndexList(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     while (it.next()) |d| {
         if (d.*.winnerLeaf().deleted) continue;
         if (!std.mem.startsWith(u8, d.*.id, "_design/")) continue;
-        indexes.append(res.arena, d.*) catch {};
+        try indexes.append(res.arena, d.*);
     }
     sortById(indexes.items);
 
@@ -8847,8 +9855,10 @@ fn hIndexDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const ddoc_raw = req.params.get("ddoc") orelse return err(res, 400, "bad_request", "missing ddoc");
     const idx_type = req.params.get("type") orelse return err(res, 400, "bad_request", "missing type");
     const index_name = req.params.get("name") orelse return err(res, 400, "bad_request", "missing name");
+    const auth = try requestAuth(app, req, res);
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
+    if (!isDbAdminFor(db, auth)) return err(res, 403, "forbidden", "You are not a db or server admin.");
 
     if (!std.mem.eql(u8, idx_type, "json")) {
         return err(res, 404, "not_found", "missing");
@@ -8869,6 +9879,24 @@ fn hIndexDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const zi = doc_obj.get("zouch_indexes") orelse return err(res, 404, "not_found", "missing");
     if (zi != .object) return err(res, 404, "not_found", "missing");
     var indexes = zi.object;
+    const removed_entry = indexes.get(index_name) orelse return err(res, 404, "not_found", "missing");
+    var idx_file_to_delete: ?[]const u8 = null;
+    if (removed_entry == .object) {
+        if (removed_entry.object.get("fields")) |fv| {
+            if (fv == .array and fv.array.items.len > 0) {
+                var field_names: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (fv.array.items) |item| {
+                    if (indexFieldName(item)) |fname| {
+                        field_names.append(res.arena, fname) catch {};
+                    }
+                }
+                if (field_names.items.len > 0) {
+                    const pfs = removed_entry.object.get("partial_filter_selector");
+                    idx_file_to_delete = mangoIndexNameWithFilter(res.arena, field_names.items, pfs) catch null;
+                }
+            }
+        }
+    }
     if (!indexes.orderedRemove(index_name)) {
         return err(res, 404, "not_found", "missing");
     }
@@ -8900,10 +9928,126 @@ fn hIndexDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             else => return e,
         };
     }
+    if (idx_file_to_delete) |idx_file| db.deleteMangoIndex(idx_file);
 
     res.status = 200;
     res.content_type = .JSON;
     res.body = "{\"ok\":true}";
+}
+
+fn mangoLowerBound(items: []const std.json.Value, target: std.json.Value, inclusive: bool) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const row = items[mid];
+        const key_v = if (row == .object) (row.object.get("key") orelse .null) else .null;
+        const c = valueCmp(key_v, target) orelse 0;
+        const go_right = if (inclusive) c < 0 else c <= 0;
+        if (go_right) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn collectMangoRangeIds(
+    items: []const std.json.Value,
+    eq: ?std.json.Value,
+    lower: ?std.json.Value,
+    lower_inclusive: bool,
+    upper: ?std.json.Value,
+    upper_inclusive: bool,
+    examined_keys: *usize,
+    alloc: std.mem.Allocator,
+    ids: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const start_idx: usize = if (eq) |qv|
+        mangoLowerBound(items, qv, true)
+    else if (lower) |lv|
+        mangoLowerBound(items, lv, lower_inclusive)
+    else
+        0;
+
+    for (items[start_idx..]) |row| {
+        examined_keys.* += 1;
+        if (row != .object) continue;
+        const id_v = row.object.get("id") orelse continue;
+        const key_v = row.object.get("key") orelse continue;
+        if (id_v != .string) continue;
+        if (eq) |qv| {
+            if (valueCmp(key_v, qv) != 0) break;
+        }
+        if (lower) |lv| {
+            const c = valueCmp(key_v, lv) orelse continue;
+            if (if (lower_inclusive) c < 0 else c <= 0) continue;
+        }
+        if (upper) |uv| {
+            const c = valueCmp(key_v, uv) orelse continue;
+            if (if (upper_inclusive) c > 0 else c >= 0) break;
+        }
+        try ids.append(alloc, id_v.string);
+    }
+}
+
+fn hasMangoIndexDeclared(db: *Db, arena: std.mem.Allocator, fields: []const []const u8) bool {
+    var it = db.designs.keyIterator();
+    while (it.next()) |did_ptr| {
+        const ddoc = db.get(did_ptr.*) orelse continue;
+        if (ddoc.winnerLeaf().deleted) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, ddoc.winnerLeaf().body, .{}) catch continue;
+        if (parsed.value != .object) continue;
+        const zi = parsed.value.object.get("zouch_indexes") orelse continue;
+        if (zi != .object) continue;
+        for (zi.object.values()) |entry| {
+            if (entry != .object) continue;
+            if (entry.object.get("partial_filter_selector") != null) continue;
+            const flds = entry.object.get("fields") orelse continue;
+            if (flds != .array or flds.array.items.len != fields.len) continue;
+            var match = true;
+            for (flds.array.items, fields) |fv, expected| {
+                const fname = indexFieldName(fv) orelse {
+                    match = false;
+                    break;
+                };
+                if (!std.mem.eql(u8, fname, expected)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+const ExplainIndexLoc = struct {
+    ddoc_id: []const u8,
+    name: []const u8,
+};
+
+fn explainIndexLocFor(db: *Db, arena: std.mem.Allocator, field: []const u8) ?ExplainIndexLoc {
+    var it = db.designs.keyIterator();
+    while (it.next()) |did_ptr| {
+        const ddoc = db.get(did_ptr.*) orelse continue;
+        if (ddoc.winnerLeaf().deleted) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, ddoc.winnerLeaf().body, .{}) catch continue;
+        if (parsed.value != .object) continue;
+        const indexes = parsed.value.object.get("zouch_indexes") orelse continue;
+        if (indexes != .object) continue;
+        var zit = indexes.object.iterator();
+        while (zit.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            if (entry.value_ptr.*.object.get("partial_filter_selector") != null) continue;
+            const fields = entry.value_ptr.*.object.get("fields") orelse continue;
+            if (fields != .array or fields.array.items.len != 1) continue;
+            const fname = indexFieldName(fields.array.items[0]) orelse continue;
+            if (std.mem.eql(u8, fname, field)) return .{ .ddoc_id = did_ptr.*, .name = entry.key_ptr.* };
+        }
+    }
+    return null;
 }
 
 /// The name an index was created under, found by the first field it covers.
@@ -8957,6 +10101,14 @@ fn hLocalDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = l.items;
 }
 
+fn explainSingleFieldJson(alloc: std.mem.Allocator, field: []const u8) ![]u8 {
+    var fb: std.ArrayListUnmanaged(u8) = .empty;
+    try fb.appendSlice(alloc, "[{");
+    try jsonw.writeString(&fb, alloc, field);
+    try fb.appendSlice(alloc, ":\"asc\"}]");
+    return fb.items;
+}
+
 fn hExplain(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     var selector: ?std.json.Value = null;
@@ -8966,7 +10118,7 @@ fn hExplain(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var hint_name: ?[]const u8 = null;
     var sort_field_names: std.ArrayListUnmanaged([]const u8) = .empty;
     defer sort_field_names.deinit(res.arena);
-    if (fullBody(req, res.arena) catch null) |body| {
+    if (fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else null) |body| {
         if (parseBody(res, body) catch null) |root| {
             if (root == .object) {
                 selector = root.object.get("selector");
@@ -9000,13 +10152,13 @@ fn hExplain(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     if (sort_field_names.items.len == 1) {
         const sf = sort_field_names.items[0];
-        const has_index = loadMangoIndex(db, res.arena, sf) != null or (selector != null and findPartialIndexFor(db, res.arena, sf, selector.?) != null);
+        const has_index = hasMangoIndexDeclared(db, res.arena, &.{sf}) or (selector != null and findPartialIndexFor(db, res.arena, sf, selector.?) != null);
         const id_ranged = selector != null and std.mem.eql(u8, sf, "_id") and selectorRangesField(selector.?, "_id");
         if (!has_index and !id_ranged) {
             return err(res, 400, "no_usable_index", "No index exists for this sort, try indexing by the sort fields.");
         }
     } else if (sort_field_names.items.len > 1) {
-        if (loadMangoIndexFields(db, res.arena, sort_field_names.items) == null) {
+        if (!hasMangoIndexDeclared(db, res.arena, sort_field_names.items)) {
             return err(res, 400, "no_usable_index", "No index exists for this sort, try indexing by the sort fields.");
         }
     }
@@ -9064,16 +10216,21 @@ fn hExplain(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                         index_ddoc = pm.ddoc_id;
                         index_type = "json";
                         index_pfs = pm.pfs;
-                        index_fields_json = try std.fmt.allocPrint(res.arena, "[{{\"{s}\":\"asc\"}}]", .{field});
+                        index_fields_json = try explainSingleFieldJson(res.arena, field);
                         break;
                     }
-                    if (loadMangoIndex(db, res.arena, field) == null) continue;
+                    if (!hasMangoIndexDeclared(db, res.arena, &.{field})) continue;
                     // Report the index's own name, which is what CouchDB shows,
                     // not the field it was found by.
-                    index_name = explainIndexNameFor(db, res.arena, field) orelse field;
-                    index_ddoc = "_design/zouch";
+                    if (explainIndexLocFor(db, res.arena, field)) |loc| {
+                        index_name = loc.name;
+                        index_ddoc = loc.ddoc_id;
+                    } else {
+                        index_name = explainIndexNameFor(db, res.arena, field) orelse field;
+                        index_ddoc = "_design/zouch";
+                    }
                     index_type = "json";
-                    index_fields_json = try std.fmt.allocPrint(res.arena, "[{{\"{s}\":\"asc\"}}]", .{field});
+                    index_fields_json = try explainSingleFieldJson(res.arena, field);
                     break;
                 }
             }
@@ -9242,7 +10399,7 @@ fn hClusterSetupPost(app: *App, req: *httpz.Request, res: *httpz.Response) !void
     const auth = try requestAuth(app, req, res);
     if (!auth.authenticated) return err(res, 401, "unauthorized", "Authentication required");
     if (auth.users_present and !auth.admin) return err(res, 403, "forbidden", "Only _admin users may configure cluster");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "body must be an object");
     const action_v = root.object.get("action") orelse return err(res, 400, "bad_request", "missing action");
@@ -9256,7 +10413,48 @@ fn hClusterSetupPost(app: *App, req: *httpz.Request, res: *httpz.Response) !void
         return err(res, 400, "bad_request", "username and password must be non-empty strings");
     }
     const creds = try std.fmt.allocPrint(res.arena, "{s}:{s}", .{ user_v.string, pass_v.string });
-    app.setAuth(creds) catch return err(res, 400, "bad_request", "invalid credentials");
+    if (std.mem.indexOfScalar(u8, user_v.string, ':') != null) {
+        return err(res, 400, "bad_request", "username must not contain ':'");
+    }
+    const id = try std.fmt.allocPrint(res.arena, "org.couchdb.user:{s}", .{user_v.string});
+    var roles: std.json.Array = std.json.Array.init(res.arena);
+    try roles.append(.{ .string = "_admin" });
+    var doc: std.json.ObjectMap = .empty;
+    try doc.put(res.arena, "_id", .{ .string = id });
+    try doc.put(res.arena, "name", user_v);
+    try doc.put(res.arena, "type", .{ .string = "user" });
+    try doc.put(res.arena, "roles", .{ .array = roles });
+    try doc.put(res.arena, "password", pass_v);
+    var doc_val: std.json.Value = .{ .object = doc };
+    try hashUserPassword(app, res, &doc_val, id);
+
+    const udb = (try app.acquireDb("_users")) orelse blk: {
+        app.mutex.lockUncancelable(app.io);
+        const created = app.createDb("_users") catch {
+            app.mutex.unlock(app.io);
+            return err(res, 500, "internal_server_error", "cannot create _users");
+        };
+        created.pins += 1;
+        app.mutex.unlock(app.io);
+        created.lock();
+        break :blk created;
+    };
+    defer app.releaseDb(udb);
+    const parent: ?Rev = if (udb.get(id)) |existing| existing.winnerLeaf().rev else null;
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    try jsonw.writeValue(&encoded, res.arena, doc_val);
+    _ = try udb.putLocal(id, encoded.items, parent, false);
+    try udb.syncWal();
+    app.invalidateUsersCache();
+
+    const has_auth_header = blk: {
+        app.auth_mutex.lockUncancelable(app.io);
+        defer app.auth_mutex.unlock(app.io);
+        break :blk app.auth_header != null;
+    };
+    if (has_auth_header) {
+        app.setAuth(creds) catch return err(res, 400, "bad_request", "invalid credentials");
+    }
     res.content_type = .JSON;
     res.body = "{\"ok\":true}";
 }
@@ -9306,25 +10504,27 @@ fn hSchedulerJobs(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
     app.mutex.lockUncancelable(app.io);
     defer app.mutex.unlock(app.io);
     var l: std.ArrayListUnmanaged(u8) = .empty;
-    const running = app.repl_running;
-    const job_count: usize = if (running != null) 1 else 0;
+    const job_count = app.repl_running.items.len;
     try l.appendSlice(res.arena, "{\"total_rows\":");
     try appendInt(&l, res.arena, job_count);
     try l.appendSlice(res.arena, ",\"offset\":0,\"jobs\":[");
-    if (running) |r| {
-        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const host = std.posix.gethostname(&host_buf) catch "localhost";
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = std.posix.gethostname(&host_buf) catch "localhost";
+    const node = try std.fmt.allocPrint(res.arena, "zouch@{s}", .{host});
+    const pid_num: u64 = @intCast(std.c.getpid());
+    for (app.repl_running.items, 0..) |r, idx| {
+        if (idx != 0) try l.append(res.arena, ',');
         const started_iso = try isoTimestamp(res.arena, r.started);
         // The field set CouchDB sends: no `state` and no `error_count` here -
         // those belong to `_scheduler/docs`.
         try l.appendSlice(res.arena, "{\"database\":\"_replicator\",\"id\":");
         if (r.repl_id) |id| try jsonw.writeString(&l, res.arena, id) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"pid\":\"<0.");
-        try appendInt(&l, res.arena, @as(u64, @intCast(std.c.getpid())));
+        try appendInt(&l, res.arena, pid_num);
         try l.appendSlice(res.arena, ".0>\",\"source\":");
-        if (r.source) |s| try jsonw.writeString(&l, res.arena, s) else try l.appendSlice(res.arena, "null");
+        if (r.source) |src| try jsonw.writeString(&l, res.arena, src) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"target\":");
-        if (r.target) |t| try jsonw.writeString(&l, res.arena, t) else try l.appendSlice(res.arena, "null");
+        if (r.target) |tgt| try jsonw.writeString(&l, res.arena, tgt) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"user\":null,\"doc_id\":");
         if (r.id) |id| try jsonw.writeString(&l, res.arena, id) else try l.appendSlice(res.arena, "null");
         try l.appendSlice(res.arena, ",\"info\":null,\"history\":[{\"timestamp\":");
@@ -9332,7 +10532,6 @@ fn hSchedulerJobs(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
         try l.appendSlice(res.arena, ",\"type\":\"started\"},{\"timestamp\":");
         try jsonw.writeString(&l, res.arena, started_iso);
         try l.appendSlice(res.arena, ",\"type\":\"added\"}],\"node\":");
-        const node = try std.fmt.allocPrint(res.arena, "zouch@{s}", .{host});
         try jsonw.writeString(&l, res.arena, node);
         try l.appendSlice(res.arena, ",\"start_time\":");
         try jsonw.writeString(&l, res.arena, started_iso);
@@ -9386,13 +10585,12 @@ fn redactEndpoint(alloc: std.mem.Allocator, value: std.json.Value) ![]const u8 {
 /// `_scheduler/docs` reports one entry per replication document, with the state
 /// and the statistics the job recorded - the data CouchDB's dashboard shows.
 fn hSchedulerDocs(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
-    app.mutex.lockUncancelable(app.io);
-    defer app.mutex.unlock(app.io);
-    const rdb = (app.getDb("_replicator") catch null) orelse {
+    const rdb = (app.acquireDb("_replicator") catch null) orelse {
         res.content_type = .JSON;
         res.body = "{\"total_rows\":0,\"offset\":0,\"docs\":[]}";
         return;
     };
+    defer app.releaseDb(rdb);
 
     var l: std.ArrayListUnmanaged(u8) = .empty;
     var count: usize = 0;
@@ -9488,7 +10686,7 @@ fn hDesignDocs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// have - the question a replicator asks before sending anything.
 fn hMissingRevs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
 
@@ -9506,7 +10704,11 @@ fn hMissingRevs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         for (rv.array.items) |item| {
             if (item != .string) continue;
             const rev = Rev.parse(item.string) catch continue;
-            if (doc == null or doc.?.findLeaf(rev) == null) try missing.append(res.arena, rev);
+            const have = if (doc) |d|
+                (d.findLeaf(rev) != null or d.findDescendantOf(rev) != null or d.retainedFor(rev) != null)
+            else
+                false;
+            if (!have) try missing.append(res.arena, rev);
         }
         if (missing.items.len == 0) continue;
         if (!first) try l.append(res.arena, ',');
@@ -9527,7 +10729,7 @@ fn hMissingRevs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 fn hRevsDiff(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "JSON object required");
 
@@ -9548,7 +10750,7 @@ fn hRevsDiff(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             if (item != .string) continue;
             const rev = Rev.parse(item.string) catch continue;
             const have = if (doc) |d| (d.findLeaf(rev) != null or d.findDescendantOf(rev) != null or d.retainedFor(rev) != null) else false;
-            if (!have) missing.append(res.arena, rev) catch {};
+            if (!have) try missing.append(res.arena, rev);
         }
         if (missing.items.len == 0) continue;
         if (!first) try l.append(res.arena, ',');
@@ -9601,8 +10803,10 @@ fn hRevsDiff(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 fn hCompact(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
+    const auth = try requestAuth(app, req, res);
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
     defer app.releaseDb(db);
+    if (!isDbAdminFor(db, auth)) return err(res, 403, "forbidden", "Only database admins may compact");
     const task_pid = app.beginTask("database_compaction", name, null, null, null, null, db.seq);
     defer app.endTask(task_pid);
     db.compactSegments() catch |e| return e;
@@ -9625,12 +10829,13 @@ fn hViewCleanup(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn hPurge(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = req.params.get("db") orelse return err(res, 400, "bad_request", "missing db");
     const auth = try requestAuth(app, req, res);
-    const body = fullBody(req, res.arena) catch return err(res, 400, "bad_request", "missing body");
+    const body = fullBody(req, res.arena, app.max_body_bytes) catch |e| if (e == error.TooLarge) return e else return err(res, 400, "bad_request", "missing body");
     const root = parseBody(res, body) catch return err(res, 400, "bad_request", "invalid JSON");
     if (root != .object) return err(res, 400, "bad_request", "body must be an object");
 
     const db = (try app.acquireDb(name)) orelse return err(res, 404, "not_found", "Database does not exist.");
-    defer app.releaseDb(db);
+    var released = false;
+    defer if (!released) app.releaseDb(db);
     if (auth.users_present and !auth.admin and !db.securityAdmin(auth.user, auth.roles)) {
         return err(res, 403, "forbidden", "Only database admins may purge");
     }
@@ -9643,16 +10848,56 @@ fn hPurge(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (revs_v != .array) return err(res, 400, "bad_request", "purge revisions must be an array");
         const doc = db.get(id) orelse continue;
         var purged_here: std.ArrayListUnmanaged([]const u8) = .empty;
+        var purged_revs: std.ArrayListUnmanaged(Rev) = .empty;
         for (revs_v.array.items) |rv| {
             if (rv != .string) continue;
             const rev = Rev.parse(rv.string) catch continue;
+            var matched = false;
             var i = doc.leaves.items.len;
             while (i > 0) {
                 i -= 1;
-                if (doc.leaves.items[i].rev.eql(rev)) {
+                var contains_rev = doc.leaves.items[i].rev.eql(rev);
+                if (!contains_rev) {
+                    for (doc.leaves.items[i].ancestry) |anc| {
+                        if (anc.eql(rev)) {
+                            contains_rev = true;
+                            break;
+                        }
+                    }
+                }
+                if (contains_rev) {
+                    matched = true;
                     var leaf = doc.leaves.orderedRemove(i);
+                    try purged_revs.appendSlice(res.arena, leaf.ancestry);
                     leaf.deinit(db.alloc);
-                    purged_here.append(res.arena, rv.string) catch {};
+                }
+            }
+            for (doc.retained.items) |r| {
+                if (r.rev.eql(rev)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) {
+                try purged_revs.append(res.arena, rev);
+                try purged_here.append(res.arena, rv.string);
+            }
+        }
+        if (purged_revs.items.len > 0) {
+            var ri: usize = doc.retained.items.len;
+            while (ri > 0) {
+                ri -= 1;
+                const r = doc.retained.items[ri];
+                var in_purged = false;
+                for (purged_revs.items) |pr| {
+                    if (pr.eql(r.rev)) {
+                        in_purged = true;
+                        break;
+                    }
+                }
+                if (in_purged and doc.findDescendantOf(r.rev) == null and doc.findLeaf(r.rev) == null) {
+                    const rem = doc.retained.orderedRemove(ri);
+                    db.alloc.free(rem.body);
                 }
             }
         }
@@ -9676,15 +10921,27 @@ fn hPurge(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         }
     }
     if (purged_any) {
-        // Purge bypasses the normal write path, so advance the sequence to
-        // invalidate view, HNSW and text caches that borrowed document IDs.
+        // Purge bypasses the normal write path, so advance the sequence,
+        // update memory accounting, clear persisted view/search indexes, and snapshot.
         db.seq +%= 1;
+        db.recomputeApproxBytes();
+        db.recomputeStats();
+        db.clearViewIndexes();
+        db.clearSearchIndexes();
     }
     try response.appendSlice(res.arena, "},\"purge_seq\":");
     const purge_seq = if (purged_any) try db.bumpPurgeSeq() else db.purge_seq;
     try appendInt(&response, res.arena, purge_seq);
     try response.append(res.arena, '}');
-    db.snapshot() catch |e| return e;
+    if (purged_any) db.snapshot() catch |e| return e;
+    if (purged_any) {
+        app.releaseDb(db);
+        released = true;
+        if (std.mem.eql(u8, name, "_users")) app.invalidateUsersCache();
+        app.mutex.lockUncancelable(app.io);
+        defer app.mutex.unlock(app.io);
+        app.dropSearchCaches(name);
+    }
     res.status = 201;
     res.content_type = .JSON;
     res.body = response.items;
@@ -9752,8 +11009,8 @@ test "vector cache owns its document ids across a purge" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("d1");
-    db.mutex.lockUncancelable(io);
-    defer db.mutex.unlock(io);
+    db.lock();
+    defer db.unlock();
     const embedding_body = "{\"embedding_b64\":\"AACAPwAAAD8AAIA+AAAAPg==\"}";
     _ = try db.putLocal("doc-a", embedding_body, null, false);
     const cache = try hnswFor(app, db, 4, "d1");
@@ -9786,6 +11043,8 @@ test "vector index load frees the index file buffer" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("d1");
+    db.lock();
+    defer db.unlock();
     _ = try db.putLocal("doc-a", "{\"embedding_b64\":\"AACAPwAAAD8AAIA+AAAAPg==\"}", null, false);
     try buildVectorIndex(db, alloc, 4);
     const entries = (try loadVectorIndex(db, alloc, 4)) orelse return error.TestUnexpectedResult;
@@ -9806,9 +11065,11 @@ test "filter id scan frees its scratch" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("d1");
+    db.lock();
+    defer db.unlock();
     _ = try db.putLocal("_design/ddoc", "{\"filters\":{\"ok\":\"function(doc,req){ return true; }\"}}", null, false);
     _ = try db.putLocal("doc-1", "{\"a\":1}", null, false);
-    var ids = try buildFilterIds(db, alloc, "ddoc/ok", 0);
+    var ids = try buildFilterIds(db, alloc, "ddoc/ok", 0, null);
     defer freeFilterIds(alloc, &ids);
     // The design document and doc-1 both match.
     try std.testing.expectEqual(@as(usize, 2), ids.count());
@@ -9826,6 +11087,8 @@ test "mango index build releases everything on allocation failure" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("m1");
+    db.lock();
+    defer db.unlock();
     _ = try db.putLocal("d1", "{\"a\":1,\"b\":\"x\"}", null, false);
     _ = try db.putLocal("d2", "{\"a\":2,\"b\":\"y\"}", null, false);
 
@@ -9854,6 +11117,8 @@ test "document serialisation releases everything on allocation failure" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("w1");
+    db.lock();
+    defer db.unlock();
     _ = try db.putLocal("d1", "{\"a\":1,\"nested\":{\"b\":[1,2,3]}}", null, false);
     const d = db.get("d1").?;
 
@@ -9998,7 +11263,11 @@ test "cookie auth with _users restricts admin-only actions" {
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const d1 = try app.createDb("d1");
-    try d1.writeSecurity("{\"admins\":{\"names\":[\"admin\"],\"roles\":[\"_admin\"]},\"members\":{\"names\":[\"alice\",\"admin\"]}}");
+    {
+        d1.lock();
+        defer d1.unlock();
+        try d1.writeSecurity("{\"admins\":{\"names\":[\"admin\"],\"roles\":[\"_admin\"]},\"members\":{\"names\":[\"alice\",\"admin\"]}}");
+    }
     _ = try app.createDb("_replicator");
 
     // Create _admin user in _users (when no static auth_header is configured)
@@ -10124,10 +11393,16 @@ test "hRevsDiff ancestor revisions and hBulkDocs new_edits=false validate_doc_up
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("d1");
-    const r1 = try db.putLocal("doc1", "{\"v\":1}", null, false);
     var revbuf: [64]u8 = undefined;
-    const rev1 = r1.rev.write(&revbuf);
-    _ = try db.putLocal("doc1", "{\"v\":2}", r1.rev, false);
+    const rev1 = blk: {
+        db.lock();
+        defer db.unlock();
+        const r1 = try db.putLocal("doc1", "{\"v\":1}", null, false);
+        const r1s = try alloc.dupe(u8, r1.rev.write(&revbuf));
+        _ = try db.putLocal("doc1", "{\"v\":2}", r1.rev, false);
+        break :blk r1s;
+    };
+    defer alloc.free(rev1);
 
     const missing_rev = "2-00000000000000000000000000000000";
     const revs_body = try std.fmt.allocPrint(alloc, "{{\"doc1\":[\"{s}\",\"{s}\"]}}", .{ rev1, missing_rev });
@@ -10142,7 +11417,11 @@ test "hRevsDiff ancestor revisions and hBulkDocs new_edits=false validate_doc_up
     try std.testing.expectEqual(@as(usize, 1), missing_arr.items.len);
     try std.testing.expectEqualStrings(missing_rev, missing_arr.items[0].string);
 
-    _ = try db.putLocal("_design/guard", "{\"validate_doc_update\":\"function(newDoc){ if(newDoc.bad) throw({forbidden:'nope'}); }\"}", null, false);
+    {
+        db.lock();
+        defer db.unlock();
+        _ = try db.putLocal("_design/guard", "{\"validate_doc_update\":\"function(newDoc){ if(newDoc.bad) throw({forbidden:'nope'}); }\"}", null, false);
+    }
     var bd = try dispatchTestReq(app, .POST, "/d1/_bulk_docs", hBulkDocs, "d1", null, &.{.{ "content-type", "application/json" }}, &.{.{ "new_edits", "false" }}, "{\"docs\":[{\"_id\":\"doc2\",\"_rev\":\"1-00000000000000000000000000000000\",\"bad\":true}],\"new_edits\":false}");
     defer bd.ht.deinit();
     try std.testing.expectEqual(@as(u16, 201), bd.status);
@@ -10160,9 +11439,13 @@ test "mango range type matching, $text search, fields projection, and execution_
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("m1");
-    _ = try db.putLocal("alpha", "{\"name\":\"alpha\",\"nested\":{\"x\":1,\"y\":\"z\"}}", null, false);
-    _ = try db.putLocal("beta", "{\"name\":\"beta\",\"nested\":{\"x\":2}}", null, false);
-    _ = try db.putLocal("odd", "{\"name\":\"odd\",\"nested\":{\"x\":\"nope\",\"z\":3}}", null, false);
+    {
+        db.lock();
+        defer db.unlock();
+        _ = try db.putLocal("alpha", "{\"name\":\"alpha\",\"nested\":{\"x\":1,\"y\":\"z\"}}", null, false);
+        _ = try db.putLocal("beta", "{\"name\":\"beta\",\"nested\":{\"x\":2}}", null, false);
+        _ = try db.putLocal("odd", "{\"name\":\"odd\",\"nested\":{\"x\":\"nope\",\"z\":3}}", null, false);
+    }
 
     // $gte: 2 must not match string "z" in alpha.nested.y
     var f1 = try dispatchTestReq(app, .POST, "/m1/_find", hFind, "m1", null, &.{.{ "content-type", "application/json" }}, &.{}, "{\"selector\":{\"nested\":{\"$keyMapMatch\":{\"$gte\":2}}}}");
@@ -10192,10 +11475,14 @@ test "views descending range, reduce skip/limit, and vector search errors + rest
         const app = try App.init(alloc, io, root);
         defer app.deinit();
         const db = try app.createDb("v1");
-        _ = try db.putLocal("_design/v", "{\"views\":{\"by_k\":{\"map\":\"function(doc){ if(doc.k) emit(doc.k, 1); }\",\"reduce\":\"_count\"}}}", null, false);
-        _ = try db.putLocal("d1", "{\"k\":\"a\",\"embedding_b64\":\"AACAPwAAAAAAAAAAAAAAAA==\"}", null, false);
-        _ = try db.putLocal("d2", "{\"k\":\"b\"}", null, false);
-        _ = try db.putLocal("d3", "{\"k\":\"c\"}", null, false);
+        {
+            db.lock();
+            defer db.unlock();
+            _ = try db.putLocal("_design/v", "{\"views\":{\"by_k\":{\"map\":\"function(doc){ if(doc.k) emit(doc.k, 1); }\",\"reduce\":\"_count\"}}}", null, false);
+            _ = try db.putLocal("d1", "{\"k\":\"a\",\"embedding_b64\":\"AACAPwAAAAAAAAAAAAAAAA==\"}", null, false);
+            _ = try db.putLocal("d2", "{\"k\":\"b\"}", null, false);
+            _ = try db.putLocal("d3", "{\"k\":\"c\"}", null, false);
+        }
 
         var v_desc = try dispatchTestReqWithParams(app, .GET, "/v1/_design/v/_view/by_k", hView, "v1", null, &.{ .{ "ddoc", "v" }, .{ "view", "by_k" } }, &.{}, &.{ .{ "reduce", "false" }, .{ "descending", "true" }, .{ "startkey", "\"c\"" }, .{ "endkey", "\"b\"" } }, null);
         defer v_desc.ht.deinit();
@@ -10229,8 +11516,8 @@ test "views descending range, reduce skip/limit, and vector search errors + rest
     const app2 = try App.init(alloc, io, root);
     defer app2.deinit();
     const db2 = (try app2.getDb("v1")).?;
-    db2.mutex.lockUncancelable(io);
-    defer db2.mutex.unlock(io);
+    db2.lock();
+    defer db2.unlock();
     const cache = try hnswFor(app2, db2, 4, "v1");
     try std.testing.expectEqual(@as(usize, 1), cache.revs.items.len);
 }
@@ -10246,7 +11533,11 @@ test "DELETE /_index removes named index, preserves other views, and deletes emp
     defer app.deinit();
     const db = try app.createDb("idxdb");
 
-    _ = try db.putLocal("_design/dd", "{\"views\":{\"v1\":{\"map\":\"function(d){emit(d._id,1);}\"}}}", null, false);
+    {
+        db.lock();
+        defer db.unlock();
+        _ = try db.putLocal("_design/dd", "{\"views\":{\"v1\":{\"map\":\"function(d){emit(d._id,1);}\"}}}", null, false);
+    }
     var c1 = try dispatchTestReq(app, .POST, "/idxdb/_index", hIndexCreate, "idxdb", null, &.{.{ "content-type", "application/json" }}, &.{}, "{\"index\":{\"fields\":[\"a\"]},\"ddoc\":\"dd\",\"name\":\"idx1\"}");
     defer c1.ht.deinit();
     try std.testing.expectEqual(@as(u16, 200), c1.status);
@@ -10320,9 +11611,13 @@ test "partial_filter_selector persists, filters index rows, and gates index sele
     const app = try App.init(alloc, io, root);
     defer app.deinit();
     const db = try app.createDb("pdb");
-    _ = try db.putLocal("d1", "{\"a\":1,\"status\":\"active\"}", null, false);
-    _ = try db.putLocal("d2", "{\"a\":1,\"status\":\"archived\"}", null, false);
-    _ = try db.putLocal("d3", "{\"a\":2,\"status\":\"active\"}", null, false);
+    {
+        db.lock();
+        defer db.unlock();
+        _ = try db.putLocal("d1", "{\"a\":1,\"status\":\"active\"}", null, false);
+        _ = try db.putLocal("d2", "{\"a\":1,\"status\":\"archived\"}", null, false);
+        _ = try db.putLocal("d3", "{\"a\":2,\"status\":\"active\"}", null, false);
+    }
 
     var ci = try dispatchTestReq(app, .POST, "/pdb/_index", hIndexCreate, "pdb", null, &.{.{ "content-type", "application/json" }}, &.{}, "{\"index\":{\"fields\":[\"a\"],\"partial_filter_selector\":{\"status\":\"active\"}},\"ddoc\":\"pdd\",\"name\":\"p_idx\"}");
     defer ci.ht.deinit();
@@ -10451,7 +11746,7 @@ test "admission control enforces ZOUCH_MAX_BODY_MB (413) and ZOUCH_VECTOR_INDEX_
     try std.testing.expectEqual(@as(u16, 413), too_big.status);
     try std.testing.expect(std.mem.indexOf(u8, too_big.body, "\"too_large\"") != null);
 
-    // 2) ZOUCH_VECTOR_INDEX_MB: setting cap to 0 MiB rejects HNSW build with 507
+    // 2) ZOUCH_VECTOR_INDEX_MB: 0 means unlimited (200); positive cap rejects oversized budget
     var doc_put = try dispatchTestReq(
         app,
         .PUT,
@@ -10479,8 +11774,10 @@ test "admission control enforces ZOUCH_MAX_BODY_MB (413) and ZOUCH_VECTOR_INDEX_
         "{\"vector\":[1.0,0.0,0.0,0.0],\"k\":1,\"engine\":\"hnsw\"}",
     );
     defer vec_res.ht.deinit();
-    try std.testing.expectEqual(@as(u16, 507), vec_res.status);
-    try std.testing.expect(std.mem.indexOf(u8, vec_res.body, "\"insufficient_storage\"") != null);
+    try std.testing.expectEqual(@as(u16, 200), vec_res.status);
+
+    app.setVectorIndexMb(1);
+    try std.testing.expectError(error.VectorIndexLimitExceeded, checkVectorBudget(app, 10000, 128));
 }
 
 test "concurrent reads succeed while view index build runs without holding db.mutex" {

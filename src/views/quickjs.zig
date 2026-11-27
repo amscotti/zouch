@@ -36,31 +36,33 @@ pub const Engine = struct {
         self.timeout_ms = timeout_ms;
     }
 
-    pub fn eval(self: *Engine, code: []const u8) ![]u8 {
-        const z = try std.heap.page_allocator.dupeSentinel(u8, code, 0);
-        defer std.heap.page_allocator.free(z);
+    pub fn eval(self: *Engine, alloc: std.mem.Allocator, code: []const u8) ![]u8 {
+        const z = try alloc.dupeSentinel(u8, code, 0);
+        defer alloc.free(z);
         const s = zx_eval_timeout(self.rt, self.ctx, z.ptr, self.timeout_ms) orelse return error.JsException;
         defer zx_free_str(self.ctx, s);
-        return std.heap.page_allocator.dupe(u8, std.mem.span(s));
+        return alloc.dupe(u8, std.mem.span(s));
     }
 };
 
 test "quickjs evaluate" {
     var e = try Engine.init();
     defer e.deinit();
-    const out = try e.eval("JSON.stringify([1,2,3])");
-    defer std.heap.page_allocator.free(out);
+    const alloc = std.testing.allocator;
+    const out = try e.eval(alloc, "JSON.stringify([1,2,3])");
+    defer alloc.free(out);
     try std.testing.expectEqualStrings("[1,2,3]", out);
 }
 
 test "quickjs aborts infinite loop on timeout and remains usable" {
     var e = try Engine.initWithTimeout(50);
     defer e.deinit();
-    try std.testing.expectError(error.JsException, e.eval("while (true) {}"));
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.JsException, e.eval(alloc, "while (true) {}"));
 
     // Engine context should remain clean and usable after an interrupted eval.
-    const out = try e.eval("1 + 2");
-    defer std.heap.page_allocator.free(out);
+    const out = try e.eval(alloc, "1 + 2");
+    defer alloc.free(out);
     try std.testing.expectEqualStrings("3", out);
 }
 
@@ -123,16 +125,17 @@ test "CouchDB $regex edge cases" {
 test "quickjs map/reduce error isolation across evaluations" {
     var e = try Engine.init();
     defer e.deinit();
+    const alloc = std.testing.allocator;
 
     // Syntax error does not poison subsequent evals.
-    try std.testing.expectError(error.JsException, e.eval("function( {"));
-    const ok1 = try e.eval("JSON.stringify([10, 20].reduce(function(a, b) { return a + b; }, 0))");
-    defer std.heap.page_allocator.free(ok1);
+    try std.testing.expectError(error.JsException, e.eval(alloc, "function( {"));
+    const ok1 = try e.eval(alloc, "JSON.stringify([10, 20].reduce(function(a, b) { return a + b; }, 0))");
+    defer alloc.free(ok1);
     try std.testing.expectEqualStrings("30", ok1);
 
     // Thrown runtime exception does not poison subsequent evals.
-    try std.testing.expectError(error.JsException, e.eval("(function(){ throw new Error('boom'); })()"));
-    const ok2 = try e.eval("JSON.stringify({ok: true})");
-    defer std.heap.page_allocator.free(ok2);
+    try std.testing.expectError(error.JsException, e.eval(alloc, "(function(){ throw new Error('boom'); })()"));
+    const ok2 = try e.eval(alloc, "JSON.stringify({ok: true})");
+    defer alloc.free(ok2);
     try std.testing.expectEqualStrings("{\"ok\":true}", ok2);
 }

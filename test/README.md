@@ -33,10 +33,16 @@ Each starts its own server on a private port and needs nothing running.
 | `test/compat/feeds.sh` | Two blocked longpoll feeds must not starve ordinary CRUD. |
 | `test/compat/feeds_continuous.sh` | Continuous feeds through the shared scheduler must emit new changes, heartbeat, and close. |
 | `test/compat/feeds_many.sh` | More than 64 concurrent longpoll feeds must be accepted and must wake correctly. |
+| `test/compat/feeds_stalled.sh` | A stalled continuous _changes feed consumer must not block new feed registrations or ordinary HTTP requests (H4). |
 | `test/compat/fsync.sh` | Calibration: an fsync failure must not be acknowledged as a successful write. |
+| `test/compat/lock_domains.sh` | Every thread that touches a database takes that database's own lock: a pull replication racing ordinary writers, a longpoll feed with include_docs and an attachment download racing rewrites must lose no acknowledged write and must not crash the server. |
 | `test/compat/mango.sh` | Mango operators added for app parity: $regex, $allMatch and $keyMapMatch. |
+| `test/compat/phase4_regressions.sh` | Regression tests for Phase 4 fixes (M1-M12): purge ancestor/views, _replicator lifecycle, authorization boundaries, delete during requests, bulk per-doc errors, clean JS docs & filter req, validate_doc_update secObj/unauthorized/DELETE, Mango binary search & explain, incremental counts, digest stubs. |
+| `test/compat/phase5_compat.sh` | Regression & compatibility tests for Phase 5 (§6 compat fixes) and Phase 7 (P2, P13). |
 | `test/compat/powerloss.sh` | Power-loss test through a FUSE disk that only persists bytes on fsync. |
 | `test/compat/pull_concurrency.sh` | A pull must not freeze the server, and its target must not be deletable while it runs. |
+| `test/compat/replicate_concurrent_jobs.sh` | A hung _replicator job must not starve other _replicator jobs, and GET /_scheduler/jobs must answer while a job is running (H6). |
+| `test/compat/replicate_h3_h8_h7.sh` | Per-database checkpoint isolation (H3), per-document push rejections continuing (H8), and gzip attachment encoding preservation across PUT, inline JSON, GET, and multipart _bulk_get (H7). |
 | `test/compat/replicate_local.sh` | Replicating one database of this server into another, which CouchDB does with two plain database names and no network hop. |
 | `test/compat/replicate_resilience.sh` | An interrupted replication must resume where it stopped, never lose documents and never leave a checkpoint ahead of the data. |
 | `test/compat/replicate_retry.sh` | A failed one-shot _replicator job must stay retryable, not be marked completed. |
