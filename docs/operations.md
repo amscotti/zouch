@@ -14,8 +14,8 @@ journalctl -u zouch -f
 database cannot be recovered; a failure prints the database name and its directory. A database held
 open by a running server is reported as `skipped` and does not fail the check, so stop the service
 to check every database. It is safe to run against a stopped server and is also a useful
-pre-backup gate. `GET /_active_tasks` is currently a stub that returns an empty list; use the
-server log and `test/compat/` probes for visibility into feeds and compaction.
+pre-backup gate. `GET /_active_tasks` reports active replication jobs and view/vector index
+builds in progress.
 
 ## Backups
 
@@ -81,7 +81,8 @@ in use. To rotate:
 2. Atomically rename it over the configured path.
 3. Restart Zouch.
 
-In-memory cookie sessions are lost at restart; clients must log in again. CouchDB/PouchDB
+Cookie sessions are HMAC-SHA256 signed with a key persisted in `.session-secret`, so valid
+`AuthSession` cookies survive server restarts until they expire. CouchDB/PouchDB
 replication should use Basic auth in the source/target URL, not a browser cookie.
 
 ## Upgrade
@@ -105,7 +106,7 @@ before replacing a binary that wrote a newer format.
   segments into one.
 - `_bulk_docs` writes all WAL records and fsyncs once before replying. A failed fsync returns a JSON
   error and the batch must not be treated as durable.
-- The HTTP server uses four worker threads and eight 1 MiB body buffers; expect about 19 MB idle RSS.
+- The HTTP server uses eight worker threads and eight 1 MiB body buffers; expect about 19 MB idle RSS.
   Documents larger than the buffer pool allocate dynamically, up to the 64 MiB body cap.
 - `_local` replication checkpoints are durable in `locals.log`; a restart does not force a full
   rescan.
@@ -120,8 +121,9 @@ before replacing a binary that wrote a newer format.
   a reason other than "absent" (for example a transient out-of-memory during `open`), the database
   refuses to open instead of serving a partial or unrestricted view. Retry once memory is available;
   do not delete files to force a start.
-- Deleting a database (`DELETE /{db}`) closes its live feeds first and blocks new feeds for the
-  duration of the delete. Expect an open `_changes` request to end with a `409`.
+- Deleting a database (`DELETE /{db}`) refuses while a replication uses it (`409 conflict`), closes
+  live feeds, drains active request pins outside the global mutex, renames the directory aside
+  and deletes its files without starving other databases. Open feed responses close cleanly.
 - There is no clustering, no cross-node quorum and no built-in TLS. Bind to loopback and terminate TLS
   at Caddy or nginx.
 

@@ -63,11 +63,7 @@ pub fn encodeDoc(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, do
         try list.append(alloc, if (r.deleted) 1 else 0);
         try putU32(list, alloc, @intCast(r.body.len));
         try list.appendSlice(alloc, r.body);
-        try putU32(list, alloc, @intCast(r.ancestry.len));
-        for (r.ancestry) |anc| {
-            try putU32(list, alloc, anc.gen);
-            try list.appendSlice(alloc, &anc.hash);
-        }
+        try putU32(list, alloc, 0);
     }
 }
 
@@ -159,17 +155,9 @@ pub fn decodeDoc(alloc: std.mem.Allocator, buf: []const u8) !*Doc {
             errdefer alloc.free(copy);
             const ranc_len = try r.readU32();
             if (ranc_len > 100_000) return Error.TooLarge;
-            const ranc = try alloc.alloc(Rev, ranc_len);
-            errdefer alloc.free(ranc);
-            var m: u32 = 0;
-            while (m < ranc_len) : (m += 1) {
-                const agen = try r.readU32();
-                const ahash = try r.take(32);
-                var ah: [32]u8 = undefined;
-                @memcpy(&ah, ahash);
-                ranc[m] = .{ .gen = agen, .hash = ah };
-            }
-            try doc.retained.append(alloc, .{ .rev = .{ .gen = rgen, .hash = rh }, .deleted = rdeleted, .body = copy, .ancestry = ranc });
+            // Older records wrote a full ancestry chain per retained entry; skip it.
+            _ = try r.take(@as(usize, ranc_len) * 36);
+            try doc.retained.append(alloc, .{ .rev = .{ .gen = rgen, .hash = rh }, .deleted = rdeleted, .body = copy });
         }
     }
 
@@ -179,7 +167,7 @@ pub fn decodeDoc(alloc: std.mem.Allocator, buf: []const u8) !*Doc {
 
 fn putRetainedSize(doc: *const Doc) usize {
     var n: usize = 4;
-    for (doc.retained.items) |r| n += 4 + 32 + 1 + 4 + r.body.len + 4 + r.ancestry.len * 36;
+    for (doc.retained.items) |r| n += 4 + 32 + 1 + 4 + r.body.len + 4;
     return n;
 }
 

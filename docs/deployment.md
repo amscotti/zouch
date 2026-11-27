@@ -37,8 +37,9 @@ clamped to 4096). For per-database credentials, put lines of `database:user:pass
 readable only by the service user and
 set `ZOUCH_AUTH_FILE`; a database with an entry requires that credential, while databases without
 one fall back to the global credential (or no auth). `POST /_session` with `name` and `password`
-returns an in-memory `AuthSession` cookie scoped to the credential that matched; sessions are lost on
-restart. CouchDB/PouchDB replication can use
+returns an HMAC-SHA256 signed `AuthSession` cookie scoped to the credential that matched; the signing
+key is persisted in `.session-secret`, so sessions survive restarts until expiration. CouchDB/PouchDB
+replication can use
 `https://user:password@zouch.example.com/db`.
 
 ## Caddy
@@ -74,7 +75,7 @@ snapshot and the WAL that follows it.
 - The server binds `127.0.0.1` unless a bind address is passed explicitly
   (`zouch serve /var/lib/zouch 5985 0.0.0.0`); keep the default and put Caddy or an SSH tunnel in
   front.
-- The HTTP server preallocates eight 1 MiB body buffers and four worker-pool threads, not 16 × the
+- The HTTP server preallocates eight 1 MiB body buffers and eight worker-pool threads, not 16 × the
   64 MiB maximum body size. A fresh process idles around 19 MB RSS; large bodies allocate dynamically.
 - Authentication supports a global credential (`ZOUCH_AUTH`) or a `database:user:password` file
   (`ZOUCH_AUTH_FILE`). Passwords are stored as plain text in that file, so mode `0600` is required.

@@ -11,9 +11,12 @@ const WAL_HDR = 16; // len u32 | crc u32 | seq u64
 const MANIFEST_LEN = 28; // magic 8 | gen u64 | last_seq u64 | crc u32
 const SNAP_HDR = 28; // magic 8 | gen u64 | last_seq u64 | count u32
 
+pub const MAX_STORAGE_FILE_BYTES: usize = 1 << 31;
+
 pub const Error = error{
     Corrupt,
     TooLarge,
+    FileTooLarge,
     OutOfMemory,
     InvalidRev,
     Conflict,
@@ -60,7 +63,7 @@ fn docApproxBytes(doc: *const Doc) usize {
         n += @sizeOf(tree.Leaf) + leaf.body.len + leaf.ancestry.len * @sizeOf(Rev);
     }
     for (doc.retained.items) |r| {
-        n += @sizeOf(tree.Retained) + r.body.len + r.ancestry.len * @sizeOf(Rev);
+        n += @sizeOf(tree.Retained) + r.body.len;
     }
     return n;
 }
@@ -92,7 +95,12 @@ pub const Db = struct {
     wal_dirty_tail: bool = false,
     wal_unrecoverable: bool = false,
     approx_bytes: usize = 0,
+    live_doc_count: usize = 0,
+    deleted_doc_count: usize = 0,
+    live_body_bytes: u64 = 0,
     max_memory_bytes: usize = 0,
+    max_blob_bytes: usize = 64 * 1024 * 1024,
+    uuid: [32]u8 = undefined,
     revs_limit: u32 = 1000,
     purge_seq: u64 = 0,
     security_members: std.StringHashMapUnmanaged(void) = .empty,
@@ -100,12 +108,43 @@ pub const Db = struct {
     security_member_roles: std.StringHashMapUnmanaged(void) = .empty,
     security_admin_roles: std.StringHashMapUnmanaged(void) = .empty,
     security_restricted: bool = false,
+    /// The one lock for this database's in-memory state. Every thread that
+    /// reads or writes `docs`, `seq`, `locals`, the WAL or the security maps
+    /// takes it, through `lock`/`unlock` so a safe build can check ownership.
     mutex: std.Io.Mutex = .init,
-    /// Number of replications that hold this handle while they fetch pages
-    /// with the server mutex released. Deleting a pinned database would free
-    /// the handle underneath them, so `App.deleteDb` refuses while this is
-    /// non-zero. Guarded by the server mutex, like every other field here.
+    /// Thread that holds `mutex` (safe builds only; 0 when unlocked).
+    mutex_owner: std.atomic.Value(usize) = .init(0),
+    /// Set by the server once the handle is shared between threads. The CLI
+    /// and unit tests use a `Db` from one thread with no lock, so the check
+    /// stays off for them.
+    lock_checks: bool = false,
+    /// Number of active users holding this handle (`acquireDb`, `pinDb`, `hAttGet`)
+    /// so `App.deleteDb` waits before closing it. `repl_active` distinguishes an
+    /// active replication from ordinary HTTP requests, and `closing` prevents new
+    /// acquisitions while a delete drains `pins`. Guarded by the server mutex.
     pins: usize = 0,
+    repl_active: bool = false,
+    closing: bool = false,
+
+    pub fn lock(self: *Db) void {
+        self.mutex.lockUncancelable(self.io);
+        if (std.debug.runtime_safety) self.mutex_owner.store(std.Thread.getCurrentId(), .monotonic);
+    }
+
+    pub fn unlock(self: *Db) void {
+        if (std.debug.runtime_safety) self.mutex_owner.store(0, .monotonic);
+        self.mutex.unlock(self.io);
+    }
+
+    /// Mutating methods call this: two threads changing one database under
+    /// different locks lost fsynced writes (GLM review C1), so a caller that
+    /// forgot the lock now fails loudly in safe builds.
+    pub fn assertLocked(self: *const Db) void {
+        if (!std.debug.runtime_safety or !self.lock_checks) return;
+        if (self.mutex_owner.load(.monotonic) != std.Thread.getCurrentId()) {
+            @panic("Db mutated without holding db.mutex");
+        }
+    }
 
     pub fn open(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !*Db {
         std.Io.Dir.cwd().createDirPath(io, path) catch |e| switch (e) {
@@ -122,6 +161,16 @@ pub const Db = struct {
             error.PathAlreadyExists => {},
             else => return e,
         };
+        if (dir.openDir(io, "blobs", .{ .iterate = true })) |bdir_const| {
+            var bdir = bdir_const;
+            defer bdir.close(io);
+            var bit = bdir.iterate();
+            while (bit.next(io) catch null) |entry| {
+                if (entry.kind == .file and std.mem.startsWith(u8, entry.name, ".upload-") and std.mem.endsWith(u8, entry.name, ".bin")) {
+                    bdir.deleteFile(io, entry.name) catch {};
+                }
+            }
+        } else |_| {}
 
         const self = try alloc.create(Db);
         errdefer alloc.destroy(self);
@@ -148,9 +197,11 @@ pub const Db = struct {
         self.locals_size = try self.locals_wal.length(io);
         try self.loadLocals();
         self.recomputeApproxBytes();
+        self.recomputeStats();
         self.revs_limit = self.readRevsLimit();
         self.purge_seq = self.readPurgeSeq();
         try self.loadSecurity();
+        try self.loadOrCreateUuid();
         return self;
     }
 
@@ -158,13 +209,56 @@ pub const Db = struct {
         self.max_memory_bytes = max;
     }
 
-    fn recomputeApproxBytes(self: *Db) void {
+    pub fn setMaxBlobBytes(self: *Db, max: usize) void {
+        self.max_blob_bytes = max;
+    }
+
+    fn loadOrCreateUuid(self: *Db) !void {
+        const bytes = self.readFile("uuid", 64) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        if (bytes) |raw| {
+            defer self.alloc.free(raw);
+            const trimmed = std.mem.trim(u8, raw, " \r\n\t");
+            if (validBlobHex(trimmed)) {
+                @memcpy(&self.uuid, trimmed);
+                return;
+            }
+        }
+        var rnd: [16]u8 = undefined;
+        self.io.random(&rnd);
+        self.uuid = std.fmt.bytesToHex(rnd, .lower);
+        try self.writeAtomic("uuid", &self.uuid);
+    }
+
+    pub fn recomputeApproxBytes(self: *Db) void {
         var total: usize = 0;
         var dit = self.docs.valueIterator();
         while (dit.next()) |d| total +|= docApproxBytes(d.*);
         var lit = self.locals.valueIterator();
         while (lit.next()) |l| total +|= localApproxBytes(l.*);
         self.approx_bytes = total;
+    }
+
+    fn docBodyBytes(doc: *const Doc) u64 {
+        var b: u64 = 0;
+        for (doc.leaves.items) |leaf| b += leaf.body.len;
+        return b;
+    }
+
+    pub fn recomputeStats(self: *Db) void {
+        var live: usize = 0;
+        var deleted: usize = 0;
+        var body_bytes: u64 = 0;
+        var dit = self.docs.valueIterator();
+        while (dit.next()) |d| {
+            if (d.*.winnerLeaf().deleted) deleted += 1 else live += 1;
+            body_bytes += docBodyBytes(d.*);
+        }
+        self.live_doc_count = live;
+        self.deleted_doc_count = deleted;
+        self.live_body_bytes = body_bytes;
     }
 
     fn deinitLoaded(self: *Db) void {
@@ -193,6 +287,8 @@ pub const Db = struct {
     }
 
     fn closeInternal(self: *Db, write_snapshot: bool) void {
+        // Closing happens with no other user of the handle (pins are zero).
+        self.lock_checks = false;
         if (write_snapshot and !self.failed) self.snapshot() catch {};
         self.wal.close(self.io);
         self.locals_wal.close(self.io);
@@ -235,13 +331,13 @@ pub const Db = struct {
         if (best) |m| {
             const name = try self.snapName(m.gen);
             defer self.alloc.free(name);
-            if (self.readFile(name, 1 << 30)) |bytes| {
+            if (self.readStorageFile(name)) |bytes| {
                 defer self.alloc.free(bytes);
                 try self.loadSnapshot(bytes, m.gen);
                 loaded_snapshot = true;
             } else |e| {
                 // A missing snapshot may mean the alternate generation is the
-                // usable copy. Any other error (TooLarge, OutOfMemory, EIO)
+                // usable copy. Any other error (FileTooLarge, OutOfMemory, EIO)
                 // must fail closed: silently opening an older or empty view
                 // loses acknowledged data.
                 if (e != error.FileNotFound) return e;
@@ -249,7 +345,7 @@ pub const Db = struct {
                 if (other) |o| {
                     const oname = try self.snapName(o.gen);
                     defer self.alloc.free(oname);
-                    if (self.readFile(oname, 1 << 30)) |obytes| {
+                    if (self.readStorageFile(oname)) |obytes| {
                         defer self.alloc.free(obytes);
                         try self.loadSnapshot(obytes, o.gen);
                         loaded_snapshot = true;
@@ -299,8 +395,15 @@ pub const Db = struct {
         self.segment_seq = last_seq;
     }
 
+    fn readStorageFile(self: *Db, name: []const u8) ![]u8 {
+        return self.readFile(name, MAX_STORAGE_FILE_BYTES) catch |e| switch (e) {
+            error.TooLarge => Error.FileTooLarge,
+            else => e,
+        };
+    }
+
     fn replay(self: *Db) !void {
-        const bytes = self.readFile("wal.log", 1 << 31) catch |e| {
+        const bytes = self.readStorageFile("wal.log") catch |e| {
             if (e == error.FileNotFound) return;
             return e;
         };
@@ -401,7 +504,7 @@ pub const Db = struct {
             const name = it.next() orelse continue;
             const seq_s = it.next() orelse continue;
             const info_seq = std.fmt.parseInt(u64, seq_s, 10) catch continue;
-            const seg = self.readFile(name, 1 << 31) catch |e| switch (e) {
+            const seg = self.readStorageFile(name) catch |e| switch (e) {
                 // Raced with a merge that removed the file: safe to skip.
                 error.FileNotFound => continue,
                 // Skipping a segment we cannot read would advance segment_seq
@@ -451,34 +554,51 @@ pub const Db = struct {
             }
         }
 
-        var bytes: std.ArrayListUnmanaged(u8) = .empty;
-        defer bytes.deinit(self.alloc);
-        try bytes.appendSlice(self.alloc, SEGMENT_MAGIC);
-        try appendU32(&bytes, self.alloc, @intCast(selected.items.len));
-        var max_seq: u64 = 0;
-        for (selected.items) |d| {
-            var rec: std.ArrayListUnmanaged(u8) = .empty;
-            defer rec.deinit(self.alloc);
-            try fmt.encodeDoc(&rec, self.alloc, d);
-            try appendU32(&bytes, self.alloc, @intCast(rec.items.len));
-            try appendU32(&bytes, self.alloc, Crc.of(rec.items));
-            try bytes.appendSlice(self.alloc, rec.items);
-            max_seq = @max(max_seq, d.seq);
-        }
-
         self.segment_counter += 1;
         const name = try std.fmt.allocPrint(self.alloc, "segment-{d:0>6}.bin", .{self.segment_counter});
         errdefer self.alloc.free(name);
-        try self.writeAtomic(name, bytes.items);
+        const tmp = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{name});
+        defer self.alloc.free(tmp);
+        errdefer self.dir.deleteFile(self.io, tmp) catch {};
+
+        var hdr: [SEGMENT_MAGIC.len + 4]u8 = undefined;
+        @memcpy(hdr[0..SEGMENT_MAGIC.len], SEGMENT_MAGIC);
+        std.mem.writeInt(u32, hdr[SEGMENT_MAGIC.len..][0..4], @intCast(selected.items.len), .little);
+
+        var max_seq: u64 = 0;
+        {
+            const f = try self.dir.createFile(self.io, tmp, .{ .truncate = true });
+            defer f.close(self.io);
+            var offset: u64 = 0;
+            try f.writePositionalAll(self.io, &hdr, offset);
+            offset += hdr.len;
+
+            var rec: std.ArrayListUnmanaged(u8) = .empty;
+            defer rec.deinit(self.alloc);
+            for (selected.items) |d| {
+                rec.clearRetainingCapacity();
+                try fmt.encodeDoc(&rec, self.alloc, d);
+                try self.writeDocFrame(f, &offset, rec.items);
+                max_seq = @max(max_seq, d.seq);
+            }
+            try f.sync(self.io);
+        }
+        try std.Io.Dir.rename(self.dir, tmp, self.dir, name, self.io);
+        var published = false;
+        errdefer if (!published) self.dir.deleteFile(self.io, name) catch {};
+        try self.syncParentDir(name);
+
         const new_info = [_]SegmentInfo{.{ .name = name, .max_seq = max_seq }};
         try self.writeSegmentsManifestFor(&new_info);
 
+        try self.segments.ensureUnusedCapacity(self.alloc, 1);
         for (self.segments.items) |old| {
             self.dir.deleteFile(self.io, old.name) catch {};
             self.alloc.free(old.name);
         }
         self.segments.clearRetainingCapacity();
-        try self.segments.append(self.alloc, new_info[0]);
+        self.segments.appendAssumeCapacity(new_info[0]);
+        published = true;
         self.segment_seq = @max(self.segment_seq, max_seq);
     }
 
@@ -570,6 +690,9 @@ pub const Db = struct {
         errdefer self.dir.deleteFile(self.io, tmp) catch {};
         defer f.close(self.io);
 
+        // Stack safety note: allocates ~72 KiB on the caller's stack; safe on
+        // 16 MiB HTTP worker and 2 MiB replicator stacks, never call from the
+        // 1 MiB feed scheduler thread.
         var write_buf: [64 * 1024]u8 = undefined;
         var file_writer = f.writer(self.io, &write_buf);
         // Bound the copy before it reaches the disk, and hash it on the way
@@ -582,11 +705,17 @@ pub const Db = struct {
         var hashed = limited.interface.hashed(&hasher, &hash_buf);
         const total = hashed.reader.streamRemaining(&file_writer.interface) catch |e| switch (e) {
             error.ReadFailed => return error.ReadFailed,
-            // A body past the limit is refused by the limited reader; that is
-            // the only way the sink rejects a write here.
-            error.WriteFailed => return error.TooLarge,
+            error.WriteFailed => return file_writer.err orelse error.Io,
         };
-        try file_writer.interface.flush();
+        if (total == max) {
+            if (reader.peekByte()) |_| {
+                return error.TooLarge;
+            } else |e| switch (e) {
+                error.EndOfStream => {},
+                error.ReadFailed => return error.ReadFailed,
+            }
+        }
+        file_writer.interface.flush() catch return file_writer.err orelse error.Io;
         try f.sync(self.io);
         var digest: [16]u8 = undefined;
         hasher.final(&digest);
@@ -629,7 +758,7 @@ pub const Db = struct {
         const f = try self.dir.openFile(self.io, p, .{});
         defer f.close(self.io);
         const len = try f.length(self.io);
-        if (len > 64 * 1024 * 1024) return error.TooLarge;
+        if (len > self.max_blob_bytes) return error.TooLarge;
         const out = try alloc.alloc(u8, @intCast(len));
         errdefer alloc.free(out);
         _ = try f.readPositionalAll(self.io, out, 0);
@@ -856,13 +985,10 @@ pub const Db = struct {
         try dst.retained.ensureTotalCapacity(alloc, src.retained.items.len);
         for (src.retained.items) |ret| {
             const body = try alloc.dupe(u8, ret.body);
-            errdefer alloc.free(body);
-            const anc = try alloc.dupe(Rev, ret.ancestry);
             dst.retained.appendAssumeCapacity(.{
                 .rev = ret.rev,
                 .deleted = ret.deleted,
                 .body = body,
-                .ancestry = anc,
             });
         }
         return dst;
@@ -870,7 +996,11 @@ pub const Db = struct {
 
     fn commitStagedDoc(self: *Db, id: []const u8, existing: ?*Doc, staging: *Doc, seq: u64) void {
         self.seq = seq;
+        const new_deleted = staging.winnerLeaf().deleted;
+        const new_bytes = docBodyBytes(staging);
         if (existing) |old| {
+            if (old.winnerLeaf().deleted) self.deleted_doc_count -= 1 else self.live_doc_count -= 1;
+            self.live_body_bytes -= docBodyBytes(old);
             const entry = self.docs.getEntry(id).?;
             entry.key_ptr.* = staging.id;
             entry.value_ptr.* = staging;
@@ -880,6 +1010,8 @@ pub const Db = struct {
             self.docs.putAssumeCapacity(staging.id, staging);
             if (std.mem.startsWith(u8, staging.id, "_design/")) self.designs.putAssumeCapacity(staging.id, {});
         }
+        if (new_deleted) self.deleted_doc_count += 1 else self.live_doc_count += 1;
+        self.live_body_bytes += new_bytes;
     }
 
     fn putLocalMode(
@@ -890,6 +1022,7 @@ pub const Db = struct {
         deleted: bool,
         do_sync: bool,
     ) !PutResult {
+        self.assertLocked();
         if (self.failed) return error.Io;
         const existing = self.docs.get(id);
         const created = existing == null;
@@ -897,7 +1030,8 @@ pub const Db = struct {
         var committed = false;
         errdefer if (!committed) staging.deinit(self.alloc);
 
-        const rev = try tree.applyLocal(staging, self.alloc, body, parent, deleted);
+        staging.revs_limit = self.revs_limit;
+        const rev = try tree.applyLocalWithLimit(staging, self.alloc, body, parent, deleted, self.revs_limit);
         const seq = self.seq + 1;
         staging.seq = seq;
         self.trimAncestry(staging, rev);
@@ -952,6 +1086,7 @@ pub const Db = struct {
         deleted: bool,
         do_sync: bool,
     ) !PutResult {
+        self.assertLocked();
         if (self.failed) return error.Io;
         const existing = self.docs.get(id);
         if (existing) |e| {
@@ -962,7 +1097,8 @@ pub const Db = struct {
         var committed = false;
         errdefer if (!committed) staging.deinit(self.alloc);
 
-        const added = try tree.applyImported(staging, self.alloc, rev, ancestry, body, deleted);
+        staging.revs_limit = self.revs_limit;
+        const added = try tree.applyImportedWithLimit(staging, self.alloc, rev, ancestry, body, deleted, self.revs_limit);
         if (!added) {
             const seq = if (existing) |e| e.seq else 0;
             staging.deinit(self.alloc);
@@ -1013,6 +1149,7 @@ pub const Db = struct {
     }
 
     pub fn bumpPurgeSeq(self: *Db) !u64 {
+        self.assertLocked();
         self.purge_seq += 1;
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, self.purge_seq, .little);
@@ -1028,6 +1165,7 @@ pub const Db = struct {
     }
 
     pub fn setRevsLimit(self: *Db, limit: u32) !void {
+        self.assertLocked();
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, limit, .little);
         try self.writeAtomic("revs_limit", &buf);
@@ -1133,13 +1271,24 @@ pub const Db = struct {
         self.locals_size = prev_size + rec.items.len;
     }
 
+    fn localsLiveBytes(self: *const Db) u64 {
+        var total: u64 = 0;
+        var it = self.locals.valueIterator();
+        while (it.next()) |lp| {
+            const l = lp.*;
+            total +|= 32 + l.id.len + l.body.len;
+        }
+        return total;
+    }
+
     pub fn compactLocals(self: *Db) !void {
         const tmp = "locals.log.tmp";
         errdefer self.dir.deleteFile(self.io, tmp) catch {};
         var offset: u64 = 0;
+        const f = try self.dir.createFile(self.io, tmp, .{ .truncate = true, .read = true });
+        var swapped = false;
+        errdefer if (!swapped) f.close(self.io);
         {
-            const f = try self.dir.createFile(self.io, tmp, .{ .truncate = true });
-            defer f.close(self.io);
             var rec: std.ArrayListUnmanaged(u8) = .empty;
             defer rec.deinit(self.alloc);
             var it = self.locals.valueIterator();
@@ -1153,20 +1302,26 @@ pub const Db = struct {
             try f.sync(self.io);
         }
         try std.Io.Dir.rename(self.dir, tmp, self.dir, "locals.log", self.io);
-        try self.syncParentDir("locals.log");
-        const new_wal = try self.dir.openFile(self.io, "locals.log", .{ .mode = .read_write });
         self.locals_wal.close(self.io);
-        self.locals_wal = new_wal;
+        self.locals_wal = f;
         self.locals_size = offset;
+        swapped = true;
+        try self.syncParentDir("locals.log");
     }
 
     pub fn readViewIndex(self: *Db, alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
-        var d = self.dir.openDir(self.io, "views", .{}) catch return null;
+        var d = self.dir.openDir(self.io, "views", .{}) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return null,
+            else => return e,
+        };
         defer d.close(self.io);
-        const f = d.openFile(self.io, name, .{}) catch return null;
+        const f = d.openFile(self.io, name, .{}) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
         defer f.close(self.io);
         const len = try f.length(self.io);
-        if (len > 64 * 1024 * 1024) return null;
+        if (len > MAX_STORAGE_FILE_BYTES) return null;
         const buf = try alloc.alloc(u8, @intCast(len));
         errdefer alloc.free(buf);
         _ = try f.readPositionalAll(self.io, buf, 0);
@@ -1187,7 +1342,10 @@ pub const Db = struct {
     }
 
     pub fn readVectorIndex(self: *Db) !?[]u8 {
-        return self.readFile("vectors.idx", 512 * 1024 * 1024) catch null;
+        return self.readFile("vectors.idx", 512 * 1024 * 1024) catch |e| switch (e) {
+            error.FileNotFound, error.TooLarge => null,
+            else => return e,
+        };
     }
 
     pub fn writeVectorIndex(self: *Db, bytes: []const u8) !void {
@@ -1195,7 +1353,10 @@ pub const Db = struct {
     }
 
     pub fn readHnswIndex(self: *Db) !?[]u8 {
-        return self.readFile("hnsw.idx", 1024 * 1024 * 1024) catch null;
+        return self.readFile("hnsw.idx", 1024 * 1024 * 1024) catch |e| switch (e) {
+            error.FileNotFound, error.TooLarge => null,
+            else => return e,
+        };
     }
 
     pub fn writeHnswIndex(self: *Db, bytes: []const u8) !void {
@@ -1203,7 +1364,10 @@ pub const Db = struct {
     }
 
     pub fn readTextIndex(self: *Db) !?[]u8 {
-        return self.readFile("text.idx", 1024 * 1024 * 1024) catch null;
+        return self.readFile("text.idx", 1024 * 1024 * 1024) catch |e| switch (e) {
+            error.FileNotFound, error.TooLarge => null,
+            else => return e,
+        };
     }
 
     pub fn writeTextIndex(self: *Db, bytes: []const u8) !void {
@@ -1211,12 +1375,18 @@ pub const Db = struct {
     }
 
     pub fn readMangoIndex(self: *Db, alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
-        var d = self.dir.openDir(self.io, "indexes", .{}) catch return null;
+        var d = self.dir.openDir(self.io, "indexes", .{}) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return null,
+            else => return e,
+        };
         defer d.close(self.io);
-        const f = d.openFile(self.io, name, .{}) catch return null;
+        const f = d.openFile(self.io, name, .{}) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
         defer f.close(self.io);
         const len = try f.length(self.io);
-        if (len > 64 * 1024 * 1024) return null;
+        if (len > MAX_STORAGE_FILE_BYTES) return null;
         const buf = try alloc.alloc(u8, @intCast(len));
         errdefer alloc.free(buf);
         _ = try f.readPositionalAll(self.io, buf, 0);
@@ -1233,6 +1403,24 @@ pub const Db = struct {
         try self.writeAtomic(path, bytes);
     }
 
+    pub fn deleteMangoIndex(self: *Db, name: []const u8) void {
+        var d = self.dir.openDir(self.io, "indexes", .{}) catch return;
+        defer d.close(self.io);
+        d.deleteFile(self.io, name) catch {};
+    }
+
+    pub fn clearSearchIndexes(self: *Db) void {
+        for ([_][]const u8{ "vectors.idx", "hnsw.idx", "text.idx" }) |f| {
+            self.dir.deleteFile(self.io, f) catch {};
+        }
+        var d = self.dir.openDir(self.io, "indexes", .{ .iterate = true }) catch return;
+        defer d.close(self.io);
+        var it = d.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind == .file) d.deleteFile(self.io, entry.name) catch {};
+        }
+    }
+
     pub fn clearViewIndexes(self: *Db) void {
         var d = self.dir.openDir(self.io, "views", .{ .iterate = true }) catch return;
         defer d.close(self.io);
@@ -1243,6 +1431,7 @@ pub const Db = struct {
     }
 
     pub fn deleteLocalDoc(self: *Db, id: []const u8, parent: u32) !u32 {
+        self.assertLocked();
         const l = self.locals.get(id) orelse return error.NotFound;
         if (l.rev != parent) return error.Conflict;
         const next = l.rev + 1;
@@ -1252,26 +1441,46 @@ pub const Db = struct {
         self.alloc.free(l.id);
         self.alloc.free(l.body);
         self.alloc.destroy(l);
-        if (self.locals_size > self.locals_limit) try self.compactLocals();
+        const threshold = @max(@as(u64, 64 * 1024), self.localsLiveBytes() *| 4);
+        if (self.locals_size > @min(threshold, self.locals_limit)) try self.compactLocals();
         return next;
     }
 
+    const SecuritySets = struct {
+        members: std.StringHashMapUnmanaged(void) = .empty,
+        admins: std.StringHashMapUnmanaged(void) = .empty,
+        member_roles: std.StringHashMapUnmanaged(void) = .empty,
+        admin_roles: std.StringHashMapUnmanaged(void) = .empty,
+        restricted: bool = false,
+
+        fn freeMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged(void)) void {
+            var it = map.keyIterator();
+            while (it.next()) |k| alloc.free(k.*);
+            map.deinit(alloc);
+            map.* = .empty;
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            freeMap(alloc, &self.members);
+            freeMap(alloc, &self.admins);
+            freeMap(alloc, &self.member_roles);
+            freeMap(alloc, &self.admin_roles);
+            self.restricted = false;
+        }
+    };
+
     fn clearSecurity(self: *Db) void {
-        var mit = self.security_members.keyIterator();
-        while (mit.next()) |k| self.alloc.free(k.*);
-        self.security_members.deinit(self.alloc);
+        var cur: SecuritySets = .{
+            .members = self.security_members,
+            .admins = self.security_admins,
+            .member_roles = self.security_member_roles,
+            .admin_roles = self.security_admin_roles,
+            .restricted = self.security_restricted,
+        };
+        cur.deinit(self.alloc);
         self.security_members = .empty;
-        var ait = self.security_admins.keyIterator();
-        while (ait.next()) |k| self.alloc.free(k.*);
-        self.security_admins.deinit(self.alloc);
         self.security_admins = .empty;
-        var mrit = self.security_member_roles.keyIterator();
-        while (mrit.next()) |k| self.alloc.free(k.*);
-        self.security_member_roles.deinit(self.alloc);
         self.security_member_roles = .empty;
-        var arit = self.security_admin_roles.keyIterator();
-        while (arit.next()) |k| self.alloc.free(k.*);
-        self.security_admin_roles.deinit(self.alloc);
         self.security_admin_roles = .empty;
         self.security_restricted = false;
     }
@@ -1280,6 +1489,7 @@ pub const Db = struct {
         self: *Db,
         map: *std.StringHashMapUnmanaged(void),
         arr_val: std.json.Value,
+        restricted: *bool,
         mark_restricted: bool,
     ) !void {
         if (arr_val != .array) return;
@@ -1289,26 +1499,41 @@ pub const Db = struct {
             const key = try self.alloc.dupe(u8, item.string);
             errdefer self.alloc.free(key);
             try map.put(self.alloc, key, {});
-            if (mark_restricted) self.security_restricted = true;
+            if (mark_restricted) restricted.* = true;
         }
     }
 
-    fn applySecurity(self: *Db, root: std.json.Value) !void {
+    fn parseSecuritySets(self: *Db, root: std.json.Value) !SecuritySets {
         if (root != .object) return error.Corrupt;
-        self.clearSecurity();
-        errdefer self.clearSecurity();
+        var out: SecuritySets = .{};
+        errdefer out.deinit(self.alloc);
         if (root.object.get("members")) |mv| {
             if (mv == .object) {
-                if (mv.object.get("names")) |nv| try self.addSecurityEntries(&self.security_members, nv, true);
-                if (mv.object.get("roles")) |rv| try self.addSecurityEntries(&self.security_member_roles, rv, true);
+                if (mv.object.get("names")) |nv| try self.addSecurityEntries(&out.members, nv, &out.restricted, true);
+                if (mv.object.get("roles")) |rv| try self.addSecurityEntries(&out.member_roles, rv, &out.restricted, true);
             }
         }
         if (root.object.get("admins")) |av| {
             if (av == .object) {
-                if (av.object.get("names")) |nv| try self.addSecurityEntries(&self.security_admins, nv, false);
-                if (av.object.get("roles")) |rv| try self.addSecurityEntries(&self.security_admin_roles, rv, false);
+                if (av.object.get("names")) |nv| try self.addSecurityEntries(&out.admins, nv, &out.restricted, false);
+                if (av.object.get("roles")) |rv| try self.addSecurityEntries(&out.admin_roles, rv, &out.restricted, false);
             }
         }
+        return out;
+    }
+
+    fn applySecuritySets(self: *Db, sets: SecuritySets) void {
+        self.clearSecurity();
+        self.security_members = sets.members;
+        self.security_admins = sets.admins;
+        self.security_member_roles = sets.member_roles;
+        self.security_admin_roles = sets.admin_roles;
+        self.security_restricted = sets.restricted;
+    }
+
+    fn applySecurity(self: *Db, root: std.json.Value) !void {
+        const sets = try self.parseSecuritySets(root);
+        self.applySecuritySets(sets);
     }
 
     fn loadSecurity(self: *Db) !void {
@@ -1371,11 +1596,14 @@ pub const Db = struct {
     }
 
     pub fn writeSecurity(self: *Db, bytes: []const u8) !void {
+        self.assertLocked();
         const parsed = std.json.parseFromSlice(std.json.Value, self.alloc, bytes, .{}) catch return error.InvalidSecurity;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSecurity;
+        var next_sec = try self.parseSecuritySets(parsed.value);
+        errdefer next_sec.deinit(self.alloc);
         try self.writeAtomic("security.json", bytes);
-        try self.applySecurity(parsed.value);
+        self.applySecuritySets(next_sec);
     }
 
     pub fn getRevsLimit(self: *const Db) u32 {
@@ -1387,6 +1615,7 @@ pub const Db = struct {
     }
 
     pub fn putLocalDoc(self: *Db, id: []const u8, body: []const u8, parent: ?u32) !u32 {
+        self.assertLocked();
         if (self.locals.get(id)) |l| {
             if (parent == null or parent.? != l.rev) return error.Conflict;
             const old_bytes = localApproxBytes(l);
@@ -1403,7 +1632,7 @@ pub const Db = struct {
             l.body = nb;
             l.rev = next_rev;
             self.approx_bytes = projected;
-            if (self.locals_size > self.locals_limit) try self.compactLocals();
+            if (self.locals_size > @min(@max(@as(u64, 64 * 1024), self.localsLiveBytes() *| 4), self.locals_limit)) try self.compactLocals();
             return next_rev;
         }
         // CouchDB accepts a checkpoint creation carrying any `0-N` rev; it is a
@@ -1413,7 +1642,7 @@ pub const Db = struct {
         if (self.max_memory_bytes > 0 and projected > self.max_memory_bytes) {
             return error.MemoryLimitExceeded;
         }
-        const rev: u32 = if (parent) |p| p + 1 else 1;
+        const rev: u32 = if (parent) |p| (std.math.add(u32, p, 1) catch return error.InvalidRev) else 1;
         const l = try createLocal(self.alloc, id, rev, body);
         errdefer {
             self.alloc.free(l.id);
@@ -1424,7 +1653,7 @@ pub const Db = struct {
         try self.appendLocal(id, rev, 0, body);
         self.locals.putAssumeCapacity(l.id, l);
         self.approx_bytes = projected;
-        if (self.locals_size > self.locals_limit) try self.compactLocals();
+        if (self.locals_size > @min(@max(@as(u64, 64 * 1024), self.localsLiveBytes() *| 4), self.locals_limit)) try self.compactLocals();
         return rev;
     }
 
@@ -1485,6 +1714,17 @@ pub const Db = struct {
         }
     }
 
+    fn writeDocFrame(self: *Db, f: std.Io.File, offset: *u64, rec: []const u8) !void {
+        var rec_hdr: [8]u8 = undefined;
+        std.mem.writeInt(u32, rec_hdr[0..4], @intCast(rec.len), .little);
+        std.mem.writeInt(u32, rec_hdr[4..8], Crc.of(rec), .little);
+        if (offset.* + rec_hdr.len + rec.len > MAX_STORAGE_FILE_BYTES) return Error.FileTooLarge;
+        try f.writePositionalAll(self.io, &rec_hdr, offset.*);
+        offset.* += rec_hdr.len;
+        try f.writePositionalAll(self.io, rec, offset.*);
+        offset.* += rec.len;
+    }
+
     fn writeAtomicDocs(self: *Db, name: []const u8, header: []const u8, drop_retained: bool) !u64 {
         const tmp = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{name});
         defer self.alloc.free(tmp);
@@ -1506,14 +1746,7 @@ pub const Db = struct {
                 if (drop_retained) d.*.dropRetained(self.alloc);
                 rec.clearRetainingCapacity();
                 try fmt.encodeDoc(&rec, self.alloc, d.*);
-
-                var rec_hdr: [8]u8 = undefined;
-                std.mem.writeInt(u32, rec_hdr[0..4], @intCast(rec.items.len), .little);
-                std.mem.writeInt(u32, rec_hdr[4..8], Crc.of(rec.items), .little);
-                try f.writePositionalAll(self.io, &rec_hdr, offset);
-                offset += rec_hdr.len;
-                try f.writePositionalAll(self.io, rec.items, offset);
-                offset += rec.items.len;
+                try self.writeDocFrame(f, &offset, rec.items);
                 max_seq = @max(max_seq, d.*.seq);
             }
             try f.sync(self.io);
@@ -1524,6 +1757,7 @@ pub const Db = struct {
     }
 
     pub fn compactSegments(self: *Db) !void {
+        self.assertLocked();
         var hdr: [SEGMENT_MAGIC.len + 4]u8 = undefined;
         @memcpy(hdr[0..SEGMENT_MAGIC.len], SEGMENT_MAGIC);
         std.mem.writeInt(u32, hdr[SEGMENT_MAGIC.len..][0..4], @intCast(self.docs.count()), .little);
@@ -1570,6 +1804,7 @@ pub const Db = struct {
     }
 
     pub fn snapshot(self: *Db) !void {
+        self.assertLocked();
         const next_gen = self.gen + 1;
         var hdr: [SNAP_HDR]u8 = undefined;
         @memcpy(hdr[0..SNAPSHOT_MAGIC.len], SNAPSHOT_MAGIC);

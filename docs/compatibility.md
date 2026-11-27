@@ -24,7 +24,7 @@ replication peers.
 | `POST /{db}/_view_cleanup` | yes | deletes persisted view index files; queries rebuild them |
 | `POST /{db}/_purge` | yes | removes listed revisions, recomputes the winner, drops empty documents; durable `purge_seq`; purges are local to the node and intentionally not replicated |
 | `GET/POST /{db}/_design/{ddoc}/_view/{view}` | yes | QuickJS map/custom reduce; `_count`/`_sum`; group, key/startkey/endkey, POST keys, include_docs, limit/skip; persisted per-document index; ICU string collation |
-| `POST /{db}/_find` | yes | persisted indexes plus selector scan; `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$beginsWith/$regex/$size/$type/$mod/$all/$elemMatch/$allMatch/$keyMapMatch/$and/$or/$nor/$not`; projection, limit/skip, single-field sort, opaque bookmark; `$regex` uses POSIX ERE. Comparisons use CouchDB's type order (null < boolean < number < string < array < object), so `$gt: null` means "present and not null" and a missing field matches neither `$eq` nor `$ne`; an unknown operator is `400 invalid_operator` with CouchDB's wording. `test/interop/find_parity.py` compares all 13 queries against a real CouchDB, including the refusals: a `sort` no index can serve is `400 no_usable_index` with CouchDB's exact wording, and `sort:["_id"]` is refused too unless the selector ranges over `_id` (both measured) |
+| `POST /{db}/_find` | yes | persisted indexes plus selector scan; `$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$beginsWith/$regex/$size/$type/$mod/$all/$elemMatch/$allMatch/$keyMapMatch/$and/$or/$nor/$not`; projection, limit/skip, single-field sort, opaque bookmark; `$regex` uses QuickJS `libregexp` (PCRE/ECMA subset). Comparisons use CouchDB's type order (null < boolean < number < string < array < object), so `$gt: null` means "present and not null" and a missing field matches neither `$eq` nor `$ne`; an unknown operator is `400 invalid_operator` with CouchDB's wording. `test/interop/find_parity.py` compares all 13 queries against a real CouchDB, including the refusals: a `sort` no index can serve is `400 no_usable_index` with CouchDB's exact wording, and `sort:["_id"]` is refused too unless the selector ranges over `_id` (both measured) |
 | `POST/GET /{db}/_index` | yes | persisted single-field indexes; `_find` intersects indexes for every indexed selector field and rechecks the full selector |
 | `POST /{db}/_explain` | yes | reports the index it would use (`_all_docs`, or a created index with its own name, `_design/zouch` and `def.fields`) in CouchDB's document shape: `dbname`, `index{ddoc,name,type,partitioned,def.fields}`, `partitioned`, `selector`, the full `opts` block, `limit`, `skip`, `fields`, `index_candidates`, `selector_hints`, `covering` and `mrargs`; `limit` is echoed. `test/interop/explain_parity.py` compares the shape, the created index's name and its `def` with a real CouchDB, 3/3. Divergence: `index.ddoc` is `_design/zouch` rather than a hash-named design document |
 | `GET/PUT/DELETE /{db}/{doc}/{att}` | yes | raw bytes; `Content-Type`, gzip `Content-Encoding` preserved |
@@ -120,7 +120,7 @@ and the content type. It reports 50/50 agreeing with a real CouchDB 3.5.3, with 
 | `_security` names | PASS; members are allowed, other authenticated users get 403, admins bypass |
 | `_security` roles | PASS via `_users` user documents or the local `ZOUCH_ROLES` map |
 | `_users` auth | PASS; PBKDF2 password hashing, Basic/cookie auth, roles, `_admin` bypass and `_users` protection |
-| Mango operators | `$regex` (POSIX ERE), `$allMatch`, `$keyMapMatch` and `$text` over a persisted inverted index and `execution_stats` covered by `mango.sh` |
+| Mango operators | `$regex` (QuickJS `libregexp`), `$allMatch`, `$keyMapMatch` and `$text` over a persisted inverted index and `execution_stats` covered by `mango.sh` |
 | Fuzz | PASS on the full 600-second-per-category campaign: HTTP 673,932, JSON 835,946, multipart 915,330, revisions 654,873 cases (3,079,081 total) |
 | 24-hour soak | PASS; 404,900 writes plus 100 replicated docs, 405,002 total, `zouch check` clean, peak RSS 1.46 GiB |
 | Backup/restore | `scripts/backup.sh` verifies, archives, checks tar and SHA-256; restore checked |
@@ -145,7 +145,8 @@ to confuse with a server bug:
 
 | Status | `error` | Meaning |
 |---|---|---|
-| 400 | `illegal_database_name` | name is empty, starts with `_` (except `_users`/`_replicator`), or contains `/`, `\\` or NUL |
+| 400 | `illegal_database_name` | name is empty, > 200 bytes, not `[a-z][a-z0-9_$()+-]*` (except `_users`/`_replicator`) |
+| 412 | `file_exists` | `PUT /{db}` when the database already exists |
 | 400 | `invalid_operator` | `_find` selector uses a `$operator` Zouch does not implement |
 | 409 | `database_locked` | another process holds this database's `.zouch.lock` |
 | 409 | `conflict` | a delete or a second replication request against a database a replication is using |

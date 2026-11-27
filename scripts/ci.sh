@@ -74,4 +74,11 @@ fi
 ./test/compat/feeds_continuous.sh
 ./test/compat/auto_compact.sh
 ./test/compat/crash.sh
+./test/compat/crash_requests.sh
+./test/compat/lock_domains.sh
+./test/compat/replicate_h3_h8_h7.sh
+./test/compat/feeds_stalled.sh
+./test/compat/replicate_concurrent_jobs.sh
+./test/compat/phase4_regressions.sh
+./test/compat/phase5_compat.sh
 echo "CI checks passed"

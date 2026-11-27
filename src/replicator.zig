@@ -22,6 +22,7 @@ pub const Result = struct {
     /// both, and a pull that batches shows them non-zero.
     bulk_get_attempts: usize = 0,
     bulk_get_docs: usize = 0,
+    doc_write_failures: usize = 0,
     /// Sequences the run started and ended at, when the source has them. The
     /// caller owns both and frees them; they are null unless the run finished.
     start_seq: ?[]u8 = null,
@@ -62,10 +63,11 @@ pub const Progress = struct {
     changes: usize = 0,
 };
 
-/// A pair of callbacks that take and release the caller's lock. The server has
-/// one mutex for all database state, so a pull that held it across its network
-/// waits froze every other request for the duration of the copy. With this the
-/// loop holds it only while it touches the database.
+/// A pair of callbacks that take and release the lock of the database being
+/// touched (the server passes that database's own `Db.mutex`). A pull that held
+/// it across its network waits froze every other request on that database for
+/// the duration of the copy. With this the loop holds it only while it touches
+/// the database.
 pub const Guard = struct {
     lock: ?*const fn (?*anyopaque) void = null,
     unlock: ?*const fn (?*anyopaque) void = null,
@@ -83,6 +85,10 @@ pub const Guard = struct {
 pub const Options = struct {
     source: []const u8,
     target_path: []const u8,
+    /// Identity placed in the remote checkpoint key. When omitted, `pullInto`
+    /// uses the target database's persistent UUID so a recreated or separate
+    /// target database never resumes from another database's checkpoint.
+    checkpoint_target: ?[]const u8 = null,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
     filter: ?[]const u8 = null,
@@ -114,6 +120,7 @@ pub const Options = struct {
     headers: []const std.http.Header = &.{},
     /// Prefer `/_session` cookie login up front when username/password are set.
     use_session_auth: bool = false,
+    max_attachment_bytes: usize = max_attachment,
 };
 
 /// A checkpoint kept on a remote target: the sequence reached, and the target's
@@ -263,12 +270,23 @@ fn isTransientError(err: anyerror) bool {
     return switch (err) {
         error.OutOfMemory,
         error.BadUrl,
+        error.TooLarge,
         error.AttachmentDigestMismatch,
         error.SourceHttpError,
         => false,
         else => true,
     };
 }
+
+fn setSocketTimeouts(fd: std.posix.socket_t, secs: i64) void {
+    if (@import("builtin").os.tag == .windows) return;
+    const tv: std.posix.timeval = .{ .sec = secs, .usec = 0 };
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+const max_http_response_bytes: usize = 64 * 1024 * 1024;
+const network_timeout_secs: i64 = 60;
 
 fn sleepBackoff(io: std.Io, ms: u64) void {
     std.Io.sleep(io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
@@ -344,6 +362,7 @@ const AuthSession = struct {
             .extra_headers = &hdrs,
         }) catch return false;
         defer req.deinit();
+        if (req.connection) |conn| setSocketTimeouts(conn.stream_reader.stream.socket.handle, network_timeout_secs);
         req.sendBodyComplete(payload.items) catch return false;
         var head_buf: [16 * 1024]u8 = undefined;
         var response = req.receiveHead(&head_buf) catch return false;
@@ -386,6 +405,61 @@ fn httpRequest(
     return httpRequestSession(client, alloc, method, url, &session, body, null, diag);
 }
 
+fn httpRequestOnce(
+    client: *std.http.Client,
+    alloc: std.mem.Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    extra_headers: []const std.http.Header,
+    aw: *std.Io.Writer.Allocating,
+) !std.http.Status {
+    const uri = std.Uri.parse(url) catch return error.BadUrl;
+    var req_opts: std.http.Client.RequestOptions = .{ .extra_headers = extra_headers };
+    if (body != null) req_opts.redirect_behavior = .unhandled;
+    var req = try client.request(method, uri, req_opts);
+    defer req.deinit();
+    if (req.connection) |conn| setSocketTimeouts(conn.stream_reader.stream.socket.handle, network_timeout_secs);
+
+    if (body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var bw = try req.sendBodyUnflushed(&.{});
+        try bw.writer.writeAll(payload);
+        try bw.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try alloc.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try alloc.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) alloc.free(decompress_buffer);
+
+    var transfer_buf: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, decompress_buffer);
+    var l_buf: [4096]u8 = undefined;
+    var limited = reader.limited(.limited(max_http_response_bytes), &l_buf);
+    _ = limited.interface.streamRemaining(&aw.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        else => |e| return e,
+    };
+    if (aw.writer.end == max_http_response_bytes) {
+        if (reader.peekByte()) |_| return error.TooLarge else |err| switch (err) {
+            error.EndOfStream => {},
+            error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        }
+    }
+    return response.head.status;
+}
+
 fn httpRequestSession(
     client: *std.http.Client,
     alloc: std.mem.Allocator,
@@ -419,13 +493,7 @@ fn httpRequestSession(
         var aw: std.Io.Writer.Allocating = .init(alloc);
         errdefer aw.deinit();
 
-        const res = client.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = body,
-            .response_writer = &aw.writer,
-            .extra_headers = hdrs.items,
-        }) catch |e| {
+        const http_status = httpRequestOnce(client, alloc, method, url, body, hdrs.items, &aw) catch |e| {
             if (isTransientError(e) and attempt + 1 < retry_max_attempts) {
                 aw.deinit();
                 sleepBackoff(client.io, backoff_ms);
@@ -436,7 +504,7 @@ fn httpRequestSession(
             return e;
         };
 
-        const status: u16 = @backingInt(res.status);
+        const status: u16 = @backingInt(http_status);
         if (status >= 200 and status < 300) {
             return aw.toOwnedSlice();
         }
@@ -468,7 +536,7 @@ fn httpRequestSession(
                 @tagName(method),
                 url,
                 status,
-                res.status.phrase() orelse "",
+                http_status.phrase() orelse "",
                 flat[0..n],
             });
         }
@@ -789,7 +857,12 @@ fn lastSeqString(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
 pub fn pull(alloc: std.mem.Allocator, io: std.Io, opts: Options) !Result {
     const db = try Db.open(alloc, io, opts.target_path);
     defer db.close();
-    return pullInto(alloc, io, db, opts);
+    var pull_opts = opts;
+    if (pull_opts.checkpoint_target == null) {
+        pull_opts.checkpoint_target = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ opts.target_path, &db.uuid });
+    }
+    defer if (opts.checkpoint_target == null) alloc.free(pull_opts.checkpoint_target.?);
+    return pullInto(alloc, io, db, pull_opts);
 }
 
 /// "md5-" followed by the 16-byte digest in base64, which is how CouchDB
@@ -865,6 +938,7 @@ fn httpGetAttachmentStream(
             return e;
         };
         defer req.deinit();
+        if (req.connection) |conn| setSocketTimeouts(conn.stream_reader.stream.socket.handle, network_timeout_secs);
         req.sendBodiless() catch |e| {
             if (isTransientError(e) and attempt + 1 < retry_max_attempts) {
                 sleepBackoff(client.io, backoff_ms);
@@ -992,6 +1066,7 @@ fn externalizeAttachments(
     enc_id: []const u8,
     rev_text: []const u8,
     body: []const u8,
+    max_att_bytes: usize,
     diag: ?*Diag,
     guard: Guard,
 ) ![]const u8 {
@@ -1025,12 +1100,7 @@ fn externalizeAttachments(
         try appendEncoded(&url, alloc, name);
         try url.appendSlice(alloc, "?rev=");
         try url.appendSlice(alloc, rev_text);
-        const max_len: usize = blk: {
-            if (av.object.get("length")) |lv| {
-                if (lv == .integer and lv.integer >= 0) break :blk @min(std.math.cast(usize, lv.integer) orelse max_attachment, max_attachment);
-            }
-            break :blk max_attachment;
-        };
+        const max_len: usize = max_att_bytes;
         // The response goes straight to a blob: no copy of the whole file in
         // memory, and no lock held while it arrives.
         const upload = httpGetAttachmentStream(client, alloc, db, url.items, session, max_len, diag) catch |e| {
@@ -1052,9 +1122,14 @@ pub const LocalOptions = struct {
     use_checkpoints: bool = true,
     doc_ids: ?*const IdFilter = null,
     diag: ?*Diag = null,
+    /// Guards the target database (the one this call writes).
     lock: ?*const fn (?*anyopaque) void = null,
     unlock: ?*const fn (?*anyopaque) void = null,
     lock_ctx: ?*anyopaque = null,
+    /// Guards the source database, which has its own lock: a page is copied
+    /// out under this one and released before the target's lock is taken, so
+    /// no thread ever holds both.
+    source_guard: Guard = .{},
     on_progress: ?*const fn (?*anyopaque, Progress) void = null,
     progress_ctx: ?*anyopaque = null,
 };
@@ -1104,6 +1179,7 @@ fn copyAttachmentBlobs(alloc: std.mem.Allocator, source: *Db, target: *Db, body:
 /// unlock.
 pub fn pullLocal(alloc: std.mem.Allocator, source: *Db, target: *Db, opts: LocalOptions) !Result {
     const guard: Guard = .{ .lock = opts.lock, .unlock = opts.unlock, .ctx = opts.lock_ctx };
+    const opts_source_guard = opts.source_guard;
     const cp_key = try std.fmt.allocPrint(alloc, "local:{s}", .{opts.source_name});
     defer alloc.free(cp_key);
     const cp_id = try checkpointId(alloc, .{ .source = cp_key, .doc_ids = opts.doc_ids });
@@ -1133,9 +1209,12 @@ pub fn pullLocal(alloc: std.mem.Allocator, source: *Db, target: *Db, opts: Local
             rows.deinit(alloc);
         }
         var docs_in_page: usize = 0;
+        // The last sequence of the page *before* `doc_ids` filtering: a page
+        // that holds no selected document must still advance past itself.
+        var page_max = since;
         {
-            guard.enter();
-            defer guard.leave();
+            opts_source_guard.enter();
+            defer opts_source_guard.leave();
             var page: std.ArrayListUnmanaged(*Doc) = .empty;
             defer page.deinit(alloc);
             var it = source.docs.valueIterator();
@@ -1151,6 +1230,9 @@ pub fn pullLocal(alloc: std.mem.Allocator, source: *Db, target: *Db, opts: Local
             if (page.items.len > opts.page_size) page.shrinkRetainingCapacity(opts.page_size);
             docs_in_page = page.items.len;
             for (page.items) |doc| {
+                if (doc.seq > page_max) page_max = doc.seq;
+            }
+            for (page.items) |doc| {
                 if (opts.doc_ids) |set| {
                     if (!set.contains(doc.id)) continue;
                 }
@@ -1160,6 +1242,7 @@ pub fn pullLocal(alloc: std.mem.Allocator, source: *Db, target: *Db, opts: Local
                     const body_copy = try alloc.dupe(u8, leaf.body);
                     errdefer alloc.free(body_copy);
                     const anc_copy = try alloc.dupe(Rev, leaf.ancestry);
+                    errdefer alloc.free(anc_copy);
                     try rows.append(alloc, .{
                         .id = id_copy,
                         .seq = doc.seq,
@@ -1189,10 +1272,6 @@ pub fn pullLocal(alloc: std.mem.Allocator, source: *Db, target: *Db, opts: Local
             result.documents += 1;
         }
 
-        var page_max = since;
-        for (rows.items) |row| {
-            if (row.seq > page_max) page_max = row.seq;
-        }
         {
             guard.enter();
             defer guard.leave();
@@ -1219,9 +1298,10 @@ pub fn pullInto(alloc: std.mem.Allocator, io: std.Io, db: *Db, opts: Options) !R
         _ = session.loginSession(&client);
     }
 
+    const cp_target: []const u8 = opts.checkpoint_target orelse if (opts.target_path.len > 0) opts.target_path else &db.uuid;
     const cp_id = try checkpointId(alloc, .{
         .source = source,
-        .target = opts.target_path,
+        .target = cp_target,
         .filter = opts.filter,
         .doc_ids = opts.doc_ids,
         .selector = opts.selector,
@@ -1322,7 +1402,10 @@ pub fn pullInto(alloc: std.mem.Allocator, io: std.Io, db: *Db, opts: Options) !R
                 if (change != .object) return error.InvalidSourceResponse;
                 const rev_v = change.object.get("rev") orelse return error.InvalidSourceResponse;
                 if (rev_v != .string) return error.InvalidSourceResponse;
-                const rev = Rev.parse(rev_v.string) catch return error.InvalidSourceResponse;
+                const rev = Rev.parse(rev_v.string) catch {
+                    result.doc_write_failures += 1;
+                    continue;
+                };
                 // Skip a revision the database already holds, which is what
                 // CouchDB's `_revs_diff` pre-pass saves: without it every
                 // re-run fetched and re-imported every changed document.
@@ -1477,8 +1560,11 @@ fn fetchPending(
                     (if (v == .string) v.string else "")
                 else
                     "";
-                const rev = Rev.parse(rev_text) catch return error.InvalidSourceResponse;
-                try importFetchedDoc(alloc, client, source, session, db, id_text, rev, text.items, opts.diag, guard);
+                const rev = Rev.parse(rev_text) catch {
+                    result.doc_write_failures += 1;
+                    continue;
+                };
+                try importFetchedDoc(alloc, client, source, session, db, id_text, rev, text.items, opts.max_attachment_bytes, opts.diag, guard);
                 result.documents += 1;
             }
         }
@@ -1509,7 +1595,7 @@ fn fetchIndividually(
         defer alloc.free(url);
         const body = try httpGet(client, alloc, url, session, opts.diag);
         defer alloc.free(body);
-        try importFetchedDoc(alloc, client, source, session, db, p.id, p.rev, body, opts.diag, guard);
+        try importFetchedDoc(alloc, client, source, session, db, p.id, p.rev, body, opts.max_attachment_bytes, opts.diag, guard);
         result.documents += 1;
     }
 }
@@ -1525,6 +1611,7 @@ fn importFetchedDoc(
     id: []const u8,
     rev: Rev,
     doc_body: []const u8,
+    max_att_bytes: usize,
     diag: ?*Diag,
     guard: Guard,
 ) !void {
@@ -1544,7 +1631,7 @@ fn importFetchedDoc(
                     if (rid != .string) continue;
                     const idx_u32 = std.math.cast(u32, i) orelse return error.InvalidSourceResponse;
                     const g = start_gen -| idx_u32;
-                    const ar = revFromParts(g, rid.string) catch return error.InvalidSourceResponse;
+                    const ar = revFromParts(g, rid.string) catch continue;
                     try ancestry.append(alloc, ar);
                 }
             }
@@ -1558,7 +1645,7 @@ fn importFetchedDoc(
     const rev_text = rev.write(&revbuf);
     const enc_id = try urlEncode(alloc, id);
     defer alloc.free(enc_id);
-    const stored = externalizeAttachments(db, body_arena.allocator(), client, source, session, enc_id, rev_text, doc_body, diag, guard) catch |e| {
+    const stored = externalizeAttachments(db, body_arena.allocator(), client, source, session, enc_id, rev_text, doc_body, max_att_bytes, diag, guard) catch |e| {
         if (diag) |d| d.set("attachment on {s} rev {s}: {s}", .{ id, rev_text, @errorName(e) });
         return e;
     };
@@ -1569,12 +1656,16 @@ fn importFetchedDoc(
     }
 }
 
-fn gzipDecode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
+fn gzipDecode(alloc: std.mem.Allocator, data: []const u8, max_bytes: usize) ![]u8 {
     var in: std.Io.Reader = .fixed(data);
+    var win_buf: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&in, .gzip, &win_buf);
+    var l_buf: [4096]u8 = undefined;
+    var limited = decompress.reader.limited(.limited(max_bytes +| 1), &l_buf);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    var decompress: flate.Decompress = .init(&in, .gzip, &.{});
-    _ = decompress.reader.streamRemaining(&out.writer) catch return error.InvalidGzip;
+    const written = limited.interface.streamRemaining(&out.writer) catch return error.InvalidGzip;
+    if (written > max_bytes) return error.TooLarge;
     return out.toOwnedSlice();
 }
 
@@ -1612,8 +1703,9 @@ fn inlineAttachments(db: *Db, alloc: std.mem.Allocator, doc: *std.json.Value) !v
         };
         if (entry.object.get("encoding")) |enc| {
             if (enc == .string and std.mem.eql(u8, enc.string, "gzip")) {
-                const decoded = gzipDecode(alloc, bytes) catch {
+                const decoded = gzipDecode(alloc, bytes, db.max_blob_bytes) catch |e| {
                     alloc.free(bytes);
+                    if (e == error.TooLarge) return e;
                     try out.put(alloc, name, entry);
                     continue;
                 };
@@ -1724,6 +1816,21 @@ const MultipartPayload = struct {
     }
 };
 
+fn appendMimeHeaderSafe(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    value: []const u8,
+    quoted: bool,
+) !void {
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) continue;
+        if (quoted and (c == '"' or c == '\\')) {
+            try out.append(alloc, '\\');
+        }
+        try out.append(alloc, c);
+    }
+}
+
 fn buildMultipartRelatedDoc(
     db: *Db,
     alloc: std.mem.Allocator,
@@ -1777,8 +1884,9 @@ fn buildMultipartRelatedDoc(
         };
         if (entry.object.get("encoding")) |enc| {
             if (enc == .string and std.mem.eql(u8, enc.string, "gzip")) {
-                const decoded = gzipDecode(alloc, bytes) catch {
+                const decoded = gzipDecode(alloc, bytes, db.max_blob_bytes) catch |e| {
                     alloc.free(bytes);
+                    if (e == error.TooLarge) return e;
                     try stub_atts.put(json_alloc, name, entry);
                     continue;
                 };
@@ -1814,9 +1922,9 @@ fn buildMultipartRelatedDoc(
         try body.appendSlice(alloc, "--");
         try body.appendSlice(alloc, &boundary);
         try body.appendSlice(alloc, "\r\nContent-Disposition: attachment; filename=\"");
-        try body.appendSlice(alloc, p.name);
+        try appendMimeHeaderSafe(&body, alloc, p.name, true);
         try body.appendSlice(alloc, "\"\r\nContent-Type: ");
-        try body.appendSlice(alloc, p.content_type);
+        try appendMimeHeaderSafe(&body, alloc, p.content_type, false);
         const len_line = try std.fmt.allocPrint(alloc, "\r\nContent-Length: {d}\r\n\r\n", .{p.bytes.len});
         defer alloc.free(len_line);
         try body.appendSlice(alloc, len_line);
@@ -1847,10 +1955,14 @@ fn putMultipartDoc(
     const url = try std.fmt.allocPrint(alloc, "{s}/{s}?new_edits=false", .{ target, enc_id });
     defer alloc.free(url);
     const resp = httpRequestSession(client, alloc, .PUT, url, session, payload.body, payload.content_type, diag) catch |e| {
-        result.failed += 1;
+        if (e == error.SourceHttpError and diag != null and diag.?.status >= 400 and diag.?.status < 500) {
+            result.failed += 1;
+            return;
+        }
         return e;
     };
     alloc.free(resp);
+    result.pushed += 1;
 }
 
 pub fn pushIntoWithOptions(
@@ -1870,8 +1982,10 @@ pub fn pushIntoWithOptions(
 
     const guard = opts.guard;
     const batch_size: usize = @max(opts.worker_batch_size, 1);
+    const src_key = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ opts.source_name, &db.uuid });
+    defer alloc.free(src_key);
     const cp_id = try checkpointId(alloc, .{
-        .source = opts.source_name,
+        .source = src_key,
         .target = target,
         .doc_ids = opts.doc_ids,
         .since_seq = opts.since,
@@ -2046,7 +2160,6 @@ pub fn pushIntoWithOptions(
                             guard.leave();
                             locked = false;
                             try putMultipartDoc(&client, alloc, target, &session, id_copy, mp, opts.diag, &result);
-                            result.pushed += 1;
                             _ = arena.reset(.retain_capacity);
                             guard.enter();
                             locked = true;
@@ -2054,7 +2167,6 @@ pub fn pushIntoWithOptions(
                         }
 
                         try docs.append(doc_parsed.value);
-                        result.pushed += 1;
                         if (docs.items.len >= batch_size) {
                             guard.leave();
                             locked = false;
@@ -2128,16 +2240,16 @@ fn postBulk(
     // status alone as success leaves failed revisions silently missing.
     var bulk_parsed = std.json.parseFromSlice(std.json.Value, alloc, bulk_resp, .{}) catch return error.InvalidTargetResponse;
     defer bulk_parsed.deinit();
+    var batch_failed: usize = 0;
     switch (bulk_parsed.value) {
-        // CouchDB returns an empty array for a successful new_edits=false
-        // import, even though every document was written. Per-document
-        // validation failures are returned as an error object.
+        // CouchDB returns an empty array (or per-doc results) for new_edits=false;
+        // Zouch returns only failed entries. Accept any array of per-document
+        // result objects, count failures, and keep advancing the checkpoint.
         .array => |arr| {
-            if (arr.items.len != 0 and arr.items.len != docs.items.len) return error.InvalidTargetResponse;
             for (arr.items) |row| {
                 if (row != .object) return error.InvalidTargetResponse;
                 if (row.object.get("error") != null) {
-                    result.failed += 1;
+                    batch_failed += 1;
                     continue;
                 }
                 const ok = row.object.get("ok") orelse return error.InvalidTargetResponse;
@@ -2146,11 +2258,12 @@ fn postBulk(
         },
         .object => |obj| {
             if (obj.get("error") == null) return error.InvalidTargetResponse;
-            result.failed = docs.items.len;
+            batch_failed = docs.items.len;
         },
         else => return error.InvalidTargetResponse,
     }
-    if (result.failed != 0) return error.BulkDocsFailed;
+    result.failed += batch_failed;
+    result.pushed += docs.items.len -| batch_failed;
 }
 
 test "replicator URL encoding" {

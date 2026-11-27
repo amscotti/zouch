@@ -11,6 +11,20 @@ static pthread_mutex_t g_re_mutex = PTHREAD_MUTEX_INITIALIZER;
 static JSRuntime *g_re_rt = NULL;
 static JSContext *g_re_ctx = NULL;
 
+#define RE_CACHE_SIZE 64
+#define RE_CACHE_MAX_PAT 1024
+
+typedef struct {
+    char *pat;
+    size_t plen;
+    int flags;
+    uint8_t *bc;
+    uint64_t last_used;
+} ReCacheEntry;
+
+static ReCacheEntry g_re_cache[RE_CACHE_SIZE];
+static uint64_t g_re_clock = 0;
+
 static uint64_t re_now_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -142,28 +156,74 @@ int zouch_regex_match(const unsigned char *pattern, size_t plen,
     }
     JS_UpdateStackTop(g_re_rt);
 
-    char stack_pat[512];
-    char *pat_z = stack_pat;
-    if (plen + 1 > sizeof(stack_pat)) {
-        pat_z = malloc(plen + 1);
-        if (pat_z == NULL) {
+    uint8_t *bc_buf = NULL;
+    int cached = 0;
+    for (int ci = 0; ci < RE_CACHE_SIZE; ci++) {
+        ReCacheEntry *e = &g_re_cache[ci];
+        if (e->bc != NULL && e->flags == re_flags && e->plen == plen &&
+            (plen == 0 || memcmp(e->pat, pat, plen) == 0)) {
+            e->last_used = ++g_re_clock;
+            bc_buf = e->bc;
+            cached = 1;
+            break;
+        }
+    }
+
+    if (bc_buf == NULL) {
+        char stack_pat[512];
+        char *pat_z = stack_pat;
+        if (plen + 1 > sizeof(stack_pat)) {
+            pat_z = malloc(plen + 1);
+            if (pat_z == NULL) {
+                pthread_mutex_unlock(&g_re_mutex);
+                free(utf16_buf);
+                return -1;
+            }
+        }
+        if (plen > 0) memcpy(pat_z, pat, plen);
+        pat_z[plen] = '\0';
+
+        int bc_len = 0;
+        char err_msg[128];
+        bc_buf = lre_compile(&bc_len, err_msg, sizeof(err_msg),
+                             pat_z, plen, re_flags, g_re_ctx);
+        if (pat_z != stack_pat) free(pat_z);
+        if (bc_buf == NULL) {
             pthread_mutex_unlock(&g_re_mutex);
             free(utf16_buf);
             return -1;
         }
-    }
-    if (plen > 0) memcpy(pat_z, pat, plen);
-    pat_z[plen] = '\0';
 
-    int bc_len = 0;
-    char err_msg[128];
-    uint8_t *bc_buf = lre_compile(&bc_len, err_msg, sizeof(err_msg),
-                                  pat_z, plen, re_flags, g_re_ctx);
-    if (pat_z != stack_pat) free(pat_z);
-    if (bc_buf == NULL) {
-        pthread_mutex_unlock(&g_re_mutex);
-        free(utf16_buf);
-        return -1;
+        if (plen <= RE_CACHE_MAX_PAT) {
+            int victim = 0;
+            uint64_t best = UINT64_MAX;
+            for (int ci = 0; ci < RE_CACHE_SIZE; ci++) {
+                if (g_re_cache[ci].bc == NULL) {
+                    victim = ci;
+                    break;
+                }
+                if (g_re_cache[ci].last_used < best) {
+                    best = g_re_cache[ci].last_used;
+                    victim = ci;
+                }
+            }
+            char *pat_copy = malloc(plen + 1);
+            if (pat_copy != NULL) {
+                if (plen > 0) memcpy(pat_copy, pat, plen);
+                pat_copy[plen] = '\0';
+                ReCacheEntry *slot = &g_re_cache[victim];
+                if (slot->bc != NULL) {
+                    free(slot->pat);
+                    lre_realloc(g_re_ctx, slot->bc, 0);
+                }
+                slot->pat = pat_copy;
+                slot->plen = plen;
+                slot->flags = re_flags;
+                slot->bc = bc_buf;
+                slot->last_used = ++g_re_clock;
+                cached = 1;
+            }
+        }
     }
 
     int cap_count = lre_get_capture_count(bc_buf);
@@ -172,7 +232,7 @@ int zouch_regex_match(const unsigned char *pattern, size_t plen,
     if (cap_count > 32) {
         capture = calloc((size_t)cap_count * 2, sizeof(uint8_t *));
         if (capture == NULL) {
-            lre_realloc(g_re_ctx, bc_buf, 0);
+            if (!cached) lre_realloc(g_re_ctx, bc_buf, 0);
             pthread_mutex_unlock(&g_re_mutex);
             free(utf16_buf);
             return -1;
@@ -185,7 +245,7 @@ int zouch_regex_match(const unsigned char *pattern, size_t plen,
     JS_SetInterruptHandler(g_re_rt, NULL, NULL);
 
     if (capture != stack_caps) free(capture);
-    lre_realloc(g_re_ctx, bc_buf, 0);
+    if (!cached) lre_realloc(g_re_ctx, bc_buf, 0);
     pthread_mutex_unlock(&g_re_mutex);
     free(utf16_buf);
 

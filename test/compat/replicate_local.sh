@@ -85,4 +85,20 @@ jq -e '.reason == "local_endpoints_not_supported"' < "$body" >/dev/null
 rm -f "$body"
 echo "local endpoints refused"
 
+echo "== doc_ids with non-matching pages terminates (H5) =="
+curl -fsS -X PUT "$Z/h5_src" >/dev/null
+curl -fsS -X PUT "$Z/h5_dst" >/dev/null
+curl -fsS -X PUT "$Z/h5_dst2" >/dev/null
+for i in 0 1 2 3 4; do
+  curl -fsS -X PUT "$Z/h5_src/d$i" -H 'content-type: application/json' -d "{\"n\":$i}" >/dev/null
+done
+curl -fsS -m 5 -X POST "$Z/_replicate" -H 'content-type: application/json' \
+  -d '{"source":"h5_src","target":"h5_dst","doc_ids":["d4"],"worker_batch_size":2}' >"$TMP/h5a.json"
+[ "$(jq -r .documents "$TMP/h5a.json")" = "1" ]
+[ "$(curl -fsS "$Z/h5_dst" | jq -r .doc_count)" = "1" ]
+curl -fsS -m 5 -X POST "$Z/_replicate" -H 'content-type: application/json' \
+  -d '{"source":"h5_src","target":"h5_dst2","doc_ids":["d0"],"worker_batch_size":2}' >"$TMP/h5b.json"
+[ "$(jq -r .documents "$TMP/h5b.json")" = "1" ]
+[ "$(curl -fsS "$Z/h5_dst2" | jq -r .doc_count)" = "1" ]
+
 echo "PASS: local to local replication"

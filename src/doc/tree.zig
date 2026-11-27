@@ -23,15 +23,17 @@ pub const Leaf = struct {
 
 /// A body kept for a revision that is no longer a leaf. CouchDB serves old
 /// revisions this way until compaction drops the bodies it no longer needs.
+/// Ancestry is derived from the active leaf that subsumed it rather than stored
+/// per retained entry, avoiding quadratic memory and WAL growth.
 pub const Retained = struct {
     rev: Rev,
     deleted: bool,
     body: []u8,
-    /// The revision's own chain, so `_revisions` can still be answered for it.
-    ancestry: []Rev,
 };
 
 pub const default_revs_limit: u32 = 1000;
+pub const max_retained_count: usize = 100;
+pub const max_retained_bytes: usize = 1 * 1024 * 1024;
 
 pub const Doc = struct {
     id: []u8,
@@ -47,7 +49,6 @@ pub const Doc = struct {
         self.leaves.deinit(alloc);
         for (self.retained.items) |r| {
             alloc.free(r.body);
-            alloc.free(r.ancestry);
         }
         self.retained.deinit(alloc);
         alloc.free(self.id);
@@ -78,9 +79,17 @@ pub const Doc = struct {
     pub fn dropRetained(self: *Doc, alloc: std.mem.Allocator) void {
         for (self.retained.items) |r| {
             alloc.free(r.body);
-            alloc.free(r.ancestry);
         }
         self.retained.clearRetainingCapacity();
+    }
+
+    pub fn ancestryFor(self: *const Doc, rev: Rev) ?[]const Rev {
+        for (self.leaves.items) |leaf| {
+            for (leaf.ancestry, 0..) |a, idx| {
+                if (a.eql(rev)) return leaf.ancestry[idx..];
+            }
+        }
+        return null;
     }
 
     pub fn winnerLeaf(self: *const Doc) *const Leaf {
@@ -143,16 +152,15 @@ pub const Doc = struct {
             }
             if (is_ancestor) {
                 const removed = self.leaves.orderedRemove(i);
+                alloc.free(removed.ancestry);
                 // Keep the body: CouchDB still serves a revision that stopped
                 // being a leaf, until compaction.
                 _ = self.retained.append(alloc, .{
                     .rev = removed.rev,
                     .deleted = removed.deleted,
                     .body = removed.body,
-                    .ancestry = removed.ancestry,
                 }) catch {
                     alloc.free(removed.body);
-                    alloc.free(removed.ancestry);
                     return error.OutOfMemory;
                 };
             } else {
@@ -162,6 +170,13 @@ pub const Doc = struct {
 
         self.leaves.appendAssumeCapacity(leaf);
         self.recomputeWinner();
+        var ret_bytes: usize = 0;
+        for (self.retained.items) |r| ret_bytes +|= r.body.len;
+        while (self.retained.items.len > max_retained_count or (self.retained.items.len > 0 and ret_bytes > max_retained_bytes)) {
+            const oldest = self.retained.orderedRemove(0);
+            ret_bytes -|= oldest.body.len;
+            alloc.free(oldest.body);
+        }
         return true;
     }
 };
@@ -522,4 +537,29 @@ test "revs_limit stemming and compaction affect bodyFor/retainedFor (_revs_info)
     try std.testing.expect(doc.retainedFor(r1) == null);
     try std.testing.expect(doc.bodyFor(r1) == null);
     try std.testing.expect(doc.bodyFor(r4) != null);
+}
+
+test "retained bounds and ancestryFor" {
+    const alloc = std.testing.allocator;
+    const doc = try create(alloc, "bounded");
+    defer doc.deinit(alloc);
+
+    var prev: ?Rev = null;
+    var first_rev: Rev = undefined;
+    var recent_rev: Rev = undefined;
+    for (0..150) |i| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"v\":{d}}}", .{i});
+        defer alloc.free(body);
+        prev = try applyLocal(doc, alloc, body, prev, false);
+        if (i == 0) first_rev = prev.?;
+        if (i == 148) recent_rev = prev.?;
+    }
+
+    try std.testing.expect(doc.retained.items.len <= max_retained_count);
+    try std.testing.expect(doc.retainedFor(first_rev) == null);
+    try std.testing.expect(doc.retainedFor(recent_rev) != null);
+
+    const anc = doc.ancestryFor(recent_rev).?;
+    try std.testing.expect(anc[0].eql(recent_rev));
+    try std.testing.expectEqual(@as(usize, doc.winnerLeaf().ancestry.len - 1), anc.len);
 }
